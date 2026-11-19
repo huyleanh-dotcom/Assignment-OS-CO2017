@@ -3,6 +3,7 @@
 
 #include "common.h"
 #include "bitops.h"
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,8 +24,28 @@ enum pt_status {
     PT_STATUS_UNMAPPED = -1,
     PT_STATUS_DENIED = -2,
     PT_STATUS_INVALID_VA = -3,
-    PT_STATUS_ERROR = -4
+    PT_STATUS_ERROR = -4,
+    PT_STATUS_EXISTS = -5
 }
+
+struct pt_mapping_info {
+    enum pt_mapping_state state;
+
+    union {
+        addr_t fpn;
+
+        struct {
+            int swptyp;
+            addr_t swpoff;
+        } swap;
+    } location;
+
+    bool rw;
+    bool user;
+    bool nx;
+    bool accessed;
+    bool dirty;
+};
 
 /* CPU Bus definition */
 #define PAGING_CPU_BUS_WIDTH 22 /* 22bit bus - MAX SPACE 4MB */
@@ -130,6 +151,9 @@ addr_t vmap_page_range(struct pcb_t *caller, addr_t addr, int pgnum,
                     struct framephy_struct *frames, struct vm_rg_struct *ret_rg);
 addr_t vm_map_ram(struct pcb_t *caller, addr_t astart, addr_t aend, addr_t mapstart, int incpgnum, struct vm_rg_struct *ret_rg);
 addr_t vm_map_kernel(struct pcb_t *caller, addr_t astart, addr_t aend, addr_t mapstart, int incpgnum, struct vm_rg_struct *ret_rg);
+int mm_reclaim_global_user(struct pcb_t* caller, int need);
+int mm_reclaim_kernel_cache(struct pcb_t* caller, int need);
+int mm_swap_active_user(struct pcb_t* caller, int need);
 addr_t alloc_pages_range(struct pcb_t *caller, int incpgnum, struct framephy_struct **frm_lst);
 int __swap_cp_page(struct memphy_struct *mpsrc, addr_t srcfpn,
                 struct memphy_struct *mpdst, addr_t dstfpn) ;
@@ -166,6 +190,7 @@ int __free(struct pcb_t *caller, int vmaid, int rgid);
 int __read(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE *data);
 int __write(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE value);
 int init_mm(struct mm_struct *mm, struct pcb_t *caller);
+int pt_unmap_one(struct pcb_t* caller, addr_t va, struct pt_mapping_info* old);
 
 /* VM prototypes */
 int pgalloc(struct pcb_t *proc, uint32_t size, uint32_t reg_index);

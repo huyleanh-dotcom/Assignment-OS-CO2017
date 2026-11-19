@@ -343,6 +343,7 @@ int pt_init_root(struct mm_struct* mm)
         return PT_STATUS_ERROR;
 
     mm->pgd = (addr_t*)root;
+    mm->fifo_pgn = NULL;
     mm->p4d = NULL;
     mm->pud = NULL;
     mm->pmd = NULL;
@@ -621,6 +622,86 @@ int pte_set_entry(struct mm_struct *mm, addr_t pgn, uint64_t pte_val, struct pcb
 	return 0;
 }
 
+/* pt_range_validate - check validate [va, va + pgnum * 4096) */
+static int pt_range_validate(addr_t va, uint64_t pgnum)
+{
+    uint64_t last;
+
+    if (!MM64_VA_PAGE_ALIGNED(va) || !mm_is_canonical_va(va))
+        return PT_STATUS_INVALID_VA;
+    if (pgnum == 0)
+        return PT_STATUS_OK;
+    if (pgnum - 1 > (UINT64_MAX - (uint64_t)va) / MM64_PAGE_SIZE)
+        return PT_STATUS_INVALID_VA;              
+
+    last = (uint64_t)va + (pgnum - 1) * MM64_PAGE_SIZE;
+    if (!mm_is_canonical_va(last))
+        return PT_STATUS_INVALID_VA;
+    if ((last ^ (uint64_t)va) & MM64_VA_SIGN_MASK)
+        return PT_STATUS_INVALID_VA;               
+    return PT_STATUS_OK;
+}
+
+/*
+ * pt_range_check_empty - mọi Leaf PTE trong vùng đều = 0 ? (chỉ đọc)
+ *   Khi gặp bảng trung gian chưa có, nhảy qua cả khoảng nó phủ
+ *   (PT thiếu = 2 MiB, PMD-table thiếu = 1 GiB, ...) thay vì walk từng trang.
+ * @busy : nếu khác NULL, nhận VA của trang đầu tiên đã có mapping
+ * Trả OK | EXISTS | INVALID_VA | ERROR (root NULL hoặc entry trung gian hỏng).
+ */
+static int pt_range_check_empty(mm64_table_t* root, addr_t va, uint64_t pgnum,
+    addr_t* busy)
+{
+    uint64_t cur, remaining;
+    int rc;
+
+    rc = pt_range_validate(va, pgnum);
+    if (rc != PT_STATUS_OK)
+        return rc;
+    if (root == NULL)
+        return PT_STATUS_ERROR;
+    if (pgnum == 0)
+        return PT_STATUS_OK;
+
+    cur = (uint64_t)va;
+    remaining = pgnum;     
+
+    while (remaining > 0) {
+        struct pt_walk w;
+        uint64_t step;                            
+
+        rc = pt_walk_internal(root, (addr_t)cur, 0, &w);
+        if (rc == PT_STATUS_OK) {
+            if (*w.pte != 0) {
+                if (busy)
+                    *busy = (addr_t)cur;
+                return PT_STATUS_EXISTS;
+            }
+            step = 1;
+        }
+        else if (rc == PT_STATUS_UNMAPPED) {
+            
+            int d = MM64_PT_LEVELS - 1;
+            uint64_t span, off;
+
+            while (d > 0 && w.tbl[d] == NULL)
+                d--;
+            span = UINT64_C(1) << MM64_LEVEL_SHIFT(d);
+            off = cur & (span - 1);
+            step = (span - off) >> MM64_PAGE_SHIFT;
+        }
+        else {
+            return rc;                               /* ERROR */
+        }
+
+        if (step >= remaining)
+            break;
+        remaining -= step;
+        cur += step * MM64_PAGE_SIZE;
+    }
+    return PT_STATUS_OK;
+}
+
 /*
  * vmap_pgd_memset - map a range of page at aligned address
  */
@@ -628,14 +709,86 @@ int vmap_pgd_memset(struct pcb_t *caller,           // process call
                     addr_t addr,                       // start address which is aligned to pagesz
                     int pgnum)                      // num of mapping page
 {
-  //int pgit = 0;
-  //uint64_t pattern = 0xdeadbeef;
+    if (caller == NULL || caller->mm == NULL)
+        return PT_STATUS_ERROR;
+    if (pgnum < 0)
+        return PT_STATUS_ERROR;
 
-  /* TODO memset the page table with given pattern
-   */
-
-  return 0;
+    return pt_range_check_empty((mm64_table_t*)caller->mm->pgd, addr,
+        (uint64_t)pgnum, NULL);
 }
+
+/*pt_map_range - map a range of page at aligned address*/
+static int pt_map_range(struct mm_struct* mm, addr_t va, uint64_t pgnum,
+    struct framephy_struct* frames, uint64_t perm,
+    int track_fifo)
+{
+    struct framephy_struct* fp;
+    struct pgn_t* nodes = NULL, * nd;
+    uint64_t i, n;
+    int rc;
+
+    if (mm == NULL || mm->pgd == NULL)
+        return PT_STATUS_ERROR;
+    if (perm & ~MM64_PTE_PERM_MASK)
+        return PT_STATUS_ERROR;
+
+    /* 1a. vùng hợp lệ và trống hoàn toàn */
+    rc = pt_range_check_empty((mm64_table_t*)mm->pgd, va, pgnum, NULL);
+    if (rc != PT_STATUS_OK)
+        return rc;
+    if (pgnum == 0)
+        return PT_STATUS_OK;
+
+    /* 1b. đúng pgnum frame, FPN hợp lệ */
+    for (n = 0, fp = frames; fp != NULL; fp = fp->fp_next, n++)
+        if ((uint64_t)fp->fpn > MM64_PTE_FPN_MAX)
+            return PT_STATUS_ERROR;
+    if (n != pgnum)
+        return PT_STATUS_ERROR;
+
+    /* 1c. cấp sẵn node FIFO để bước 3 không thể thất bại */
+    if (track_fifo) {
+        for (i = 0; i < pgnum; i++) {
+            nd = malloc(sizeof(*nd));
+            if (nd == NULL) {
+                while (nodes) { nd = nodes->pg_next; free(nodes); nodes = nd; }
+                return PT_STATUS_ERROR;
+            }
+            nd->pg_next = nodes;
+            nodes = nd;
+        }
+    }
+
+    /* 2. map từng trang */
+    for (i = 0, fp = frames; i < pgnum; i++, fp = fp->fp_next) {
+        addr_t pgn = mm64_va_to_pgn((addr_t)((uint64_t)va + i * MM64_PAGE_SIZE));
+        mm64_pte_t val;
+
+        pte_encode_present(fp->fpn, perm, &val);   /* đã kiểm ở 1b, không lỗi */
+        rc = pte_set_entry(mm, pgn, val, NULL);
+        if (rc != PT_STATUS_OK) {
+            uint64_t j;
+            for (j = 0; j < i; j++)
+                pte_set_entry(mm, mm64_va_to_pgn((addr_t)((uint64_t)va + j * MM64_PAGE_SIZE)),
+                    0, NULL);
+            while (nodes) { nd = nodes->pg_next; free(nodes); nodes = nd; }
+            return rc;
+        }
+    }
+
+    /* 3. ghi nhận cho page replacement: đẩy lần lượt vào đầu list */
+    for (i = 0; i < pgnum && nodes != NULL; i++) {
+        nd = nodes;
+        nodes = nodes->pg_next;
+        nd->pgn = mm64_va_to_pgn((addr_t)((uint64_t)va + i * MM64_PAGE_SIZE));
+        nd->pg_next = mm->fifo_pgn;
+        mm->fifo_pgn = nd;
+    }
+    return PT_STATUS_OK;
+}
+
+
 
 /*
  * vmap_page_range - map a range of page at aligned address
@@ -646,28 +799,118 @@ addr_t vmap_page_range(struct pcb_t *caller,           // process call
                     struct framephy_struct *frames, // list of the mapped frames
                     struct vm_rg_struct *ret_rg)    // return mapped region, the real mapped fp
 {                                                   // no guarantee all given pages are mapped
-//struct framephy_struct *fpit;
-//int pgit = 0;
-//addr_t pgn;
+    int rc;
 
-  /* TODO: update the rg_end and rg_start of ret_rg 
-  //ret_rg->rg_end =  ....
-  //ret_rg->rg_start = ...
-  //ret_rg->vmaid = ...
-  */
+    if (caller == NULL || caller->mm == NULL || pgnum < 0)
+        return (addr_t)(int)PT_STATUS_ERROR;
 
-  /* TODO map range of frame to address space
-   *      [addr to addr + pgnum*PAGING_PAGESZ
-   *      in page table caller->krnl->mm->pgd,
-   *                    caller->krnl->mm->pud...
-   *                    ...
-   */
+    rc = pt_map_range(caller->mm, addr, (uint64_t)pgnum, frames,
+        MM64_PTE_DEFAULT_USER & MM64_PTE_PERM_MASK, 1);
+    if (rc != PT_STATUS_OK)
+        return (addr_t)(int)rc;
 
-  /* Tracking for later page replacement activities (if needed)
-   * Enqueue new usage page */
-  //enlist_pgn_node(&caller->krnl->mm->fifo_pgn, pgn64 + pgit);
+    if (ret_rg != NULL) {
+        ret_rg->rg_start = addr;
+        ret_rg->rg_end = (addr_t)((uint64_t)addr + (uint64_t)pgnum * MM64_PAGE_SIZE);
+    }
+    return 0;
 
   return 0;
+}
+
+static void pt_fifo_forget(struct mm_struct* mm, addr_t pgn)
+{
+    struct pgn_t** pp = &mm->fifo_pgn;
+
+    while (*pp != NULL) {
+        if ((*pp)->pgn == pgn) {
+            struct pgn_t* dead = *pp;
+            *pp = dead->pg_next;
+            free(dead);
+            return;
+        }
+        pp = &(*pp)->pg_next;
+    }
+}
+
+static int pt_unmap_one_mm(struct mm_struct* mm, addr_t va,
+    struct pt_mapping_info* old)
+{
+    struct pt_walk w;
+    struct pt_mapping_info info;
+    mm64_pte_t pte;
+    int rc;
+
+    if (mm == NULL || mm->pgd == NULL)
+        return PT_STATUS_ERROR;
+    if (!MM64_VA_PAGE_ALIGNED(va) || !mm_is_canonical_va(va))
+        return PT_STATUS_INVALID_VA;
+
+    rc = pt_walk_internal((mm64_table_t*)mm->pgd, va, 0, &w);
+    if (rc != PT_STATUS_OK)
+        return rc;                                
+
+    pte = *w.pte;
+    pte_decode_info(pte, &info);
+    if (info.state == PT_MAP_EMPTY)
+        return PT_STATUS_UNMAPPED;                  /* Strict Unmap */
+    if (info.state == PT_MAP_INVALID)
+        return PT_STATUS_ERROR;                     
+    if (pde_count(w.tbl[MM64_LVL_PMD]->entries[w.idx[MM64_LVL_PMD]]) == 0)
+        return PT_STATUS_ERROR;                   
+
+    /* commit: xóa PTE, giảm count, prune ngay, quên trong FIFO */
+    *w.pte = 0;
+    pt_count_dec(&w, MM64_LVL_PT);
+    pt_prune_empty(&w);
+    pt_fifo_forget(mm, mm64_va_to_pgn(va));
+
+    if (old != NULL)
+        *old = info;
+    return PT_STATUS_OK;
+}
+
+/*
+ * pt_unmap_one - unmap a page at aligned address
+ * @caller : caller
+ * @va     : virtual address to unmap
+ * @old    : returned mapping info of the unmapped page
+ */
+
+int pt_unmap_one(struct pcb_t* caller, addr_t va, struct pt_mapping_info* old)
+{
+    if (caller == NULL)
+        return PT_STATUS_ERROR;
+    return pt_unmap_one_mm(caller->mm, va, old);
+}
+
+__attribute__((weak)) int mm_reclaim_global_user(struct pcb_t* caller, int need)
+{
+    (void)caller; (void)need; return 0;
+}
+
+__attribute__((weak)) int mm_reclaim_kernel_cache(struct pcb_t* caller, int need)
+{
+    (void)caller; (void)need; return 0;
+}
+
+__attribute__((weak)) int mm_swap_active_user(struct pcb_t* caller, int need)
+{
+    (void)caller; (void)need; return 0;
+}
+
+#define MM64_ALLOC_OOM ((addr_t)-3000)
+
+
+static void pt_frame_list_release(struct memphy_struct* mram,
+    struct framephy_struct* lst)
+{
+    while (lst != NULL) {
+        struct framephy_struct* nx = lst->fp_next;
+        MEMPHY_put_freefp(mram, lst->fpn);
+        free(lst);
+        lst = nx;
+    }
 }
 
 /*
@@ -679,35 +922,134 @@ addr_t vmap_page_range(struct pcb_t *caller,           // process call
 
 addr_t alloc_pages_range(struct pcb_t *caller, int req_pgnum, struct framephy_struct **frm_lst)
 {
-  //addr_t fpn;
-  //int pgit;
-  //struct framephy_struct *newfp_str = NULL;
-  //struct framephy_struct **cur = frm_lst;
+    int (* const stages[])(struct pcb_t*, int) = {
+    mm_reclaim_global_user, mm_reclaim_kernel_cache, mm_swap_active_user
+    };
+    const int nstages = (int)(sizeof(stages) / sizeof(stages[0]));
+    struct memphy_struct* mram;
+    struct framephy_struct* head = NULL, ** tail = &head;
+    int got = 0, stage = 0;
+    int just_reclaimed = 0;   /* hook vừa báo có frame mà vẫn lấy không được -> sang tầng sau */
 
-  /* TODO: allocate the page 
-  //caller-> ...
-  //frm_lst-> ...
-  */
+    if (frm_lst == NULL)
+        return (addr_t)(int)PT_STATUS_ERROR;
+    *frm_lst = NULL;
+    if (caller == NULL || caller->krnl == NULL || caller->krnl->mram == NULL ||
+        req_pgnum < 0)
+        return (addr_t)(int)PT_STATUS_ERROR;
+    if (req_pgnum == 0)
+        return 0;
 
+    mram = caller->krnl->mram;
+    if ((uint64_t)req_pgnum > (uint64_t)mram->maxsz / MM64_PAGE_SIZE)
+        return MM64_ALLOC_OOM;                      /* không bao giờ đủ */
 
+    while (got < req_pgnum) {
+        addr_t fpn;
+        struct framephy_struct* nd;
+
+        if (MEMPHY_get_freefp(mram, &fpn) != 0) {
+            int freed;
+
+            if (just_reclaimed)
+                stage++;                                /* hook báo sai: không treo vòng lặp */
+            if (stage >= nstages) {
+                pt_frame_list_release(mram, head);
+                return MM64_ALLOC_OOM;
+            }
+            freed = stages[stage](caller, req_pgnum - got);
+            just_reclaimed = (freed > 0);
+            if (!just_reclaimed)
+                stage++;                                /* tầng này cạn -> tầng sau */
+            continue;
+        }
+        just_reclaimed = 0;
+
+        nd = malloc(sizeof(*nd));
+        if (nd == NULL) {
+            MEMPHY_put_freefp(mram, fpn);
+            pt_frame_list_release(mram, head);
+            return (addr_t)(int)PT_STATUS_ERROR;
+        }
+        nd->fpn = fpn;
+        nd->fp_next = NULL;
+        nd->owner = caller->mm;
+        *tail = nd;
+        tail = &nd->fp_next;
+        got++;
+    }
+
+    *frm_lst = head;
+    return 0;
+}
 /*
-  for (pgit = 0; pgit < req_pgnum; pgit++)
-  {
-    // TODO: allocate the page 
-    if (MEMPHY_get_freefp(caller->mram, &fpn) == 0)
-    {
-      newfp_str->fpn = fpn;
+ * pt_vm_map - map a range of page at aligned address
+ * @caller    : caller
+ * @mm        : mm_struct
+ * @astart    : vm area start
+ * @aend      : vm area end
+ * @mapstart  : start mapping point
+ * @incpgnum  : number of mapped page
+ * @ret_rg    : returned region
+ * @perm      : permission for mapping pages
+ * @track_fifo: track fifo list or not
+ */
+static addr_t pt_vm_map(struct pcb_t* caller, struct mm_struct* mm,
+    addr_t astart, addr_t aend, addr_t mapstart,
+    int incpgnum, struct vm_rg_struct* ret_rg,
+    uint64_t perm, int track_fifo)
+{
+    struct framephy_struct* frm_lst = NULL, * fp;
+    uint64_t len;
+    addr_t ret;
+    int rc;
+
+    if (caller == NULL || caller->krnl == NULL || mm == NULL || incpgnum < 0)
+        return (addr_t)(int)PT_STATUS_ERROR;
+
+    /* 1. nằm trong area */
+    len = (uint64_t)incpgnum * MM64_PAGE_SIZE;
+    if ((uint64_t)mapstart < (uint64_t)astart ||
+        (uint64_t)mapstart >(uint64_t)aend ||
+        len > (uint64_t)aend - (uint64_t)mapstart)
+        return (addr_t)(int)PT_STATUS_INVALID_VA;
+
+    /* 2. vùng đích hợp lệ và trống */
+    rc = pt_range_check_empty((mm64_table_t*)mm->pgd, mapstart,
+        (uint64_t)incpgnum, NULL);
+    if (rc != PT_STATUS_OK)
+        return (addr_t)(int)rc;
+    if (incpgnum == 0) {
+        if (ret_rg != NULL)
+            ret_rg->rg_start = ret_rg->rg_end = mapstart;
+        return 0;
     }
-    else
-    { // TODO: ERROR CODE of obtaining somes but not enough frames
+
+    /* 3. frame */
+    ret = alloc_pages_range(caller, incpgnum, &frm_lst);
+    if (ret != 0)
+        return ret;                                 /* -3000 hoặc lỗi khác, không giữ frame nào */
+    for (fp = frm_lst; fp != NULL; fp = fp->fp_next)
+        fp->owner = mm;
+
+    /* 4. map */
+    rc = pt_map_range(mm, mapstart, (uint64_t)incpgnum, frm_lst, perm, track_fifo);
+    if (rc != PT_STATUS_OK) {
+        pt_frame_list_release(caller->krnl->mram, frm_lst);   /* trả frame + free node */
+        return (addr_t)(int)rc;
     }
-  }
-*/
 
-
-  /* End TODO */
-
-  return 0;
+    /* 5. thành công */
+    if (ret_rg != NULL) {
+        ret_rg->rg_start = mapstart;
+        ret_rg->rg_end = (addr_t)((uint64_t)mapstart + len);
+    }
+    while (frm_lst != NULL) {
+        fp = frm_lst->fp_next;
+        free(frm_lst);
+        frm_lst = fp;
+    }
+    return 0;
 }
 
 /*
@@ -731,22 +1073,30 @@ addr_t vm_map_ram(struct pcb_t *caller, addr_t astart, addr_t aend, addr_t mapst
    *in endless procedure of swap-off to get frame and we have not provide
    *duplicate control mechanism, keep it simple
    */
-  ret_alloc = alloc_pages_range(caller, incpgnum, &frm_lst);
-
-  if (ret_alloc < 0 && ret_alloc != -3000)
-    return -1;
-
-  /* Out of memory */
-  if (ret_alloc == -3000)
-  {
-    return -1;
-  }
-
-  /* it leaves the case of memory is enough but half in ram, half in swap
-   * do the swaping all to swapper to get the all in ram */
-   vmap_page_range(caller, mapstart, incpgnum, frm_lst, ret_rg);
+  if (caller == NULL)
+      return (addr_t)(int)PT_STATUS_ERROR;
+  return pt_vm_map(caller, caller->mm, astart, aend, mapstart, incpgnum, ret_rg,
+      MM64_PTE_DEFAULT_USER & MM64_PTE_PERM_MASK, 1);
 
   return 0;
+}
+
+
+/*
+ * vm_map_kernel - do the mapping all vm are to kernel storage device
+ * @caller    : caller
+ * @astart    : vm area start
+ * @aend      : vm area end
+ * @mapstart  : start mapping point
+ * @incpgnum  : number of mapped page
+ * @ret_rg    : returned region
+ */
+addr_t vm_map_kernel(struct pcb_t* caller, addr_t astart, addr_t aend, addr_t mapstart, int incpgnum, struct vm_rg_struct* ret_rg)
+{
+    if (caller == NULL || caller->krnl == NULL)
+        return (addr_t)(int)PT_STATUS_ERROR;
+    return pt_vm_map(caller, caller->krnl->mm, astart, aend, mapstart, incpgnum,
+        ret_rg, MM64_PTE_DEFAULT_KERNEL & MM64_PTE_PERM_MASK, 0);
 }
 
 /* Swap copy content page from source frame to destination frame

@@ -4,6 +4,7 @@
 #include "mm.h"
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 
 #define MM64_BITS_PER_LONG 64
@@ -345,5 +346,32 @@ static inline int pde_validate(mm64_pde_t e)
 	if ((e & MM64_PDE_ADDR_MASK) == 0)
 		return -1;
 	return 0;
+}
+
+/* pte_decode_info - giải mã Leaf PTE thành struct pt_mapping_info
+ * @pte : Leaf PTE
+ * @mi  : nơi lưu kết quả
+ * Chỉ điền các trường có thể xác định từ PTE, còn lại giữ nguyên.
+ */
+
+static inline void pte_decode_info(mm64_pte_t pte, struct pt_mapping_info* mi)
+{
+	memset(mi, 0, sizeof(*mi));
+	mi->state = pte_decode_state(pte);
+	if (mi->state == PT_MAP_PRESENT) {
+		mi->location.fpn = pte_decode_fpn(pte);
+	}
+	else if (mi->state == PT_MAP_SWAPPED) {
+		mi->location.swap.swptyp = pte_decode_swptyp(pte);
+		mi->location.swap.swpoff = pte_decode_swpoff(pte);
+	}
+	else {
+		return;                        /* EMPTY / INVALID: chỉ có state */
+	}
+	mi->rw = (pte & MM64_PTE_RW) != 0;
+	mi->user = (pte & MM64_PTE_USER) != 0;
+	mi->nx = (pte & MM64_PTE_NX) != 0;
+	mi->accessed = (pte & MM64_PTE_ACCESSED) != 0;
+	mi->dirty = (pte & MM64_PTE_DIRTY) != 0;
 }
 #endif
