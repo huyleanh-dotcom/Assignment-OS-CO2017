@@ -26,12 +26,19 @@ int __sys_memmap(struct krnl_t *krnl, uint32_t pid, struct sc_regs* regs)
 {
    int memop = regs->a1;
    BYTE value;
+   int ret = 0;
+   struct pcb_t* caller = NULL;
    /* 
     * TODO THIS DUMMY CREATE EMPTY PROC TO AVOID COMPILER NOTIFY 
     *      need to be eliminated
 	*/
-   struct pcb_t *caller = malloc(sizeof(struct pcb_t));
-   caller->krnl = malloc(sizeof(struct krnl_t));
+   if (memop == SYSMEM_MAP_OP || memop == SYSMEM_INC_OP || memop == SYSMEM_SWP_OP) {
+       caller = find_running_proc(pid);
+       if (caller == NULL) {
+           printf("sys_memmap: pid %u is not running, memop %d rejected\n", pid, memop);
+           return -1;
+       }
+   }
 
    /*
     * @bksysnet: Please note in the dual spacing design

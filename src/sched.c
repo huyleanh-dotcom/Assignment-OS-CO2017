@@ -215,3 +215,19 @@ void finish_proc(struct pcb_t *proc)
 	pthread_mutex_unlock(&queue_lock);
 }
 
+struct pcb_t* find_running_proc(uint32_t pid)
+{
+	struct pcb_t* found = NULL;
+	int i;
+
+	pthread_mutex_lock(&queue_lock);
+	for (i = 0; i < running_list.size; i++) {
+		if (running_list.proc[i] != NULL && running_list.proc[i]->pid == pid) {
+			found = running_list.proc[i];
+			break;
+		}
+	}
+	pthread_mutex_unlock(&queue_lock);
+	return found;
+}
+ 
