@@ -509,6 +509,87 @@ int libkmem_copy_to_user(struct pcb_t *caller, uint32_t source, uint32_t destina
 }
 
 
+
+__attribute__((weak)) int mm_region_is_active(struct mm_struct* mm, int vmaid, int rgid)
+{
+    (void)vmaid;
+    if (mm == NULL || rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ)
+        return 0;
+    return mm->symrgtbl[rgid].rg_end > mm->symrgtbl[rgid].rg_start;
+}
+
+/* region Kernel + offset -> VA, có kiểm biên. Trả PT_STATUS_xxx. */
+static int pt_kmem_region_va(struct pcb_t* caller, int vmaid, int rgid,
+    addr_t offset, addr_t* va)
+{
+    struct mm_struct* kmm;
+    struct vm_rg_struct* rg;
+
+    if (caller == NULL || caller->krnl == NULL || caller->krnl->mm == NULL)
+        return PT_STATUS_ERROR;
+    if (rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ)
+        return PT_STATUS_ERROR;
+
+    kmm = caller->krnl->mm;
+    if (!mm_region_is_active(kmm, vmaid, rgid))
+        return PT_STATUS_DENIED;
+
+    rg = &kmm->symrgtbl[rgid];
+    if (offset >= rg->rg_end - rg->rg_start)
+        return PT_STATUS_DENIED;                 
+
+    *va = rg->rg_start + offset;
+    return PT_STATUS_OK;
+}
+
+/* đọc / ghi 1 byte tại VA Kernel. Bên gọi giữ mmvm_lock. */
+static int pt_kmem_access_va_locked(struct pcb_t* caller, addr_t va,
+    int is_write, BYTE* data)
+{
+    struct pt_translation t;
+    int rc;
+
+    rc = pt_translate_va(caller, va, is_write ? PT_KERNEL_WRITE : PT_KERNEL_READ, &t);
+    if (rc == PT_STATUS_SWAPPED)
+        return PT_STATUS_ERROR;                  
+    if (rc != PT_STATUS_OK)
+        return rc;
+
+    if (is_write)
+        rc = MEMPHY_write(caller->krnl->mram, pt_translation_phys(&t), *data);
+    else
+        rc = MEMPHY_read(caller->krnl->mram, pt_translation_phys(&t), data);
+    return (rc == 0) ? PT_STATUS_OK : PT_STATUS_ERROR;
+}
+
+static int pt_kmem_read_locked(struct pcb_t* caller, int vmaid, int rgid,
+    addr_t offset, BYTE* data)
+{
+    addr_t va;
+    int rc;
+
+    if (data == NULL)
+        return PT_STATUS_ERROR;
+    rc = pt_kmem_region_va(caller, vmaid, rgid, offset, &va);
+    if (rc != PT_STATUS_OK)
+        return rc;
+    return pt_kmem_access_va_locked(caller, va, 0, data);
+}
+
+static int pt_kmem_write_locked(struct pcb_t* caller, int vmaid, int rgid,
+    addr_t offset, BYTE value)
+{
+    addr_t va;
+    int rc;
+
+    rc = pt_kmem_region_va(caller, vmaid, rgid, offset, &va);
+    if (rc != PT_STATUS_OK)
+        return rc;
+    return pt_kmem_access_va_locked(caller, va, 1, &value);
+}
+
+
+
 /*__read_kernel_mem - read value in kernel region memory
  *@caller: caller
  *@vmaid: ID vm area to alloc memory region
@@ -521,7 +602,12 @@ int __read_kernel_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, 
   /* TODO: provide OS memory operator for kernel memory region */
   //krnl->krnl_pgd ... or krnl->pgd ... based on kmem implementation strategy
 
-  return 0;
+    int rc;
+
+    pthread_mutex_lock(&mmvm_lock);
+    rc = pt_kmem_read_locked(caller, vmaid, rgid, offset, data);
+    pthread_mutex_unlock(&mmvm_lock);
+    return rc;
 }
 
 /*__write_kernel_mem - write a kernel region memory
@@ -536,7 +622,213 @@ int __write_kernel_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset,
   /* TODO: provide OS memory operator for kernel memory region */
   //krnl->krnl_pgd ... or krnl->pgd ... based on kmem implementation strategy
 
-  return 0;
+    int rc;
+
+    pthread_mutex_lock(&mmvm_lock);
+    rc = pt_kmem_write_locked(caller, vmaid, rgid, offset, value);
+    pthread_mutex_unlock(&mmvm_lock);
+    return rc;
+}
+
+__attribute__((weak)) int mm_handle_swapped_page(struct pcb_t* caller, addr_t va)
+{
+    (void)caller; (void)va;
+    return -1;
+}
+
+/* [offset, offset+size) phải nằm trong region rgid (vmaid 0) của mm */
+static int pt_region_span(struct mm_struct* mm, int rgid, addr_t offset,
+    addr_t size, addr_t* va)
+{
+    struct vm_rg_struct* rg;
+    addr_t len;
+
+    if (mm == NULL || rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ)
+        return PT_STATUS_ERROR;
+    if (!mm_region_is_active(mm, 0, rgid))
+        return PT_STATUS_DENIED;
+    rg = &mm->symrgtbl[rgid];
+    len = rg->rg_end - rg->rg_start;
+    if (offset > len || size > len - offset)
+        return PT_STATUS_DENIED;                   /* vượt region, không tràn số */
+    *va = rg->rg_start + offset;
+    return PT_STATUS_OK;
+}
+
+/* phys của 1 byte User; SWAPPED -> nhờ P3 fault-in rồi dịch lại */
+static int pt_user_byte_phys(struct pcb_t* caller, addr_t va, int is_write, addr_t* phys)
+{
+    struct pt_translation t;
+    int rc = pt_translate_user_for_copy(caller, va, is_write, &t);
+
+    if (rc == PT_STATUS_SWAPPED) {
+        if (mm_handle_swapped_page(caller, (addr_t)MM64_VA_PAGE_BASE(va)) != 0)
+            return PT_STATUS_ERROR;
+        rc = pt_translate_user_for_copy(caller, va, is_write, &t);
+        if (rc == PT_STATUS_SWAPPED)
+            return PT_STATUS_ERROR;
+    }
+    if (rc != PT_STATUS_OK)
+        return rc;
+    *phys = pt_translation_phys(&t);
+    return PT_STATUS_OK;
+}
+
+static int pt_copy_user_kernel(struct pcb_t* caller, int urgid, int krgid,
+    addr_t offset, addr_t size, int to_user)
+{
+    addr_t uva, kva, i;
+    int rc;
+
+    if (caller == NULL || caller->krnl == NULL || caller->krnl->mm == NULL ||
+        caller->mm == NULL)
+        return PT_STATUS_ERROR;
+
+    pthread_mutex_lock(&mmvm_lock);
+
+    /* 1 */
+    rc = pt_region_span(caller->mm, urgid, offset, size, &uva);
+    if (rc == PT_STATUS_OK)
+        rc = pt_region_span(caller->krnl->mm, krgid, offset, size, &kva);
+    if (rc != PT_STATUS_OK || size == 0)
+        goto out;
+
+    /* 2: kiểm trang đầu + mỗi biên trang */
+    for (i = 0; i < size; ) {
+        struct pt_translation t;
+        addr_t step_u = MM64_PAGE_SIZE - MM64_VA_OFFSET(uva + i);
+        addr_t step_k = MM64_PAGE_SIZE - MM64_VA_OFFSET(kva + i);
+
+        rc = pt_translate_va(caller, kva + i, to_user ? PT_KERNEL_READ : PT_KERNEL_WRITE, &t);
+        if (rc == PT_STATUS_SWAPPED)
+            rc = PT_STATUS_ERROR;                   
+        if (rc != PT_STATUS_OK)
+            goto out;
+        rc = pt_translate_user_for_copy(caller, uva + i, to_user, &t);
+        if (rc != PT_STATUS_OK && rc != PT_STATUS_SWAPPED)
+            goto out;
+        i += (step_u < step_k) ? step_u : step_k;  /* tới biên trang gần nhất */
+    }
+
+    /* 3 + 4 */
+    for (i = 0; i < size; i++) {
+        struct pt_translation kt;
+        addr_t uphys;
+        BYTE b;
+
+        rc = pt_user_byte_phys(caller, uva + i, to_user, &uphys);
+        if (rc != PT_STATUS_OK)
+            goto out;
+        rc = pt_translate_va(caller, kva + i, to_user ? PT_KERNEL_READ : PT_KERNEL_WRITE, &kt);
+        if (rc != PT_STATUS_OK) {
+            rc = PT_STATUS_ERROR;
+            goto out;
+        }
+
+        if (to_user) {
+            if (MEMPHY_read(caller->krnl->mram, pt_translation_phys(&kt), &b) != 0 ||
+                MEMPHY_write(caller->krnl->mram, uphys, b) != 0) {
+                rc = PT_STATUS_ERROR;
+                goto out;
+            }
+        }
+        else {
+            if (MEMPHY_read(caller->krnl->mram, uphys, &b) != 0 ||
+                MEMPHY_write(caller->krnl->mram, pt_translation_phys(&kt), b) != 0) {
+                rc = PT_STATUS_ERROR;
+                goto out;
+            }
+        }
+        pt_update_access_flags(caller, uva + i, to_user);
+    }
+    rc = PT_STATUS_OK;
+
+out:
+    pthread_mutex_unlock(&mmvm_lock);
+    return rc;
+}
+
+int libkmem_copy_from_user(struct pcb_t* caller, uint32_t source, uint32_t destination, uint32_t offset, uint32_t size)
+{
+    return pt_copy_user_kernel(caller, (int)source, (int)destination,
+        (addr_t)offset, (addr_t)size, 0);
+}
+
+int libkmem_copy_to_user(struct pcb_t* caller, uint32_t source, uint32_t destination, uint32_t offset, uint32_t size)
+{
+    return pt_copy_user_kernel(caller, (int)destination, (int)source,
+        (addr_t)offset, (addr_t)size, 1);
+}
+
+static int pt_zero_byte_phys(struct pcb_t* caller, int is_kernel, addr_t va, addr_t* phys)
+{
+    struct pt_translation t;
+    int rc;
+
+    if (!is_kernel)
+        return pt_user_byte_phys(caller, va, 1, phys);
+
+    rc = pt_translate_va(caller, va, PT_KERNEL_WRITE, &t);
+    if (rc == PT_STATUS_SWAPPED)
+        return PT_STATUS_ERROR;                    
+    if (rc != PT_STATUS_OK)
+        return rc;
+    *phys = pt_translation_phys(&t);
+    return PT_STATUS_OK;
+}
+
+int vm_zero_allocated_range(struct pcb_t* caller, int is_kernel, addr_t start, addr_t end)
+{
+    addr_t va;
+
+    if (caller == NULL || caller->krnl == NULL || caller->krnl->mram == NULL)
+        return PT_STATUS_ERROR;
+    if (is_kernel ? (caller->krnl->mm == NULL) : (caller->mm == NULL))
+        return PT_STATUS_ERROR;
+    if (start > end)
+        return PT_STATUS_ERROR;
+    if (start == end)
+        return PT_STATUS_OK;
+    if (!mm_is_canonical_va(start) || !mm_is_canonical_va(end - 1) ||
+        (((uint64_t)start ^ (uint64_t)(end - 1)) & MM64_VA_SIGN_MASK))
+        return PT_STATUS_INVALID_VA;
+
+    /* 1. kiểm trước, mỗi trang một lần */
+    for (va = start; va < end; ) {
+        struct pt_translation t;
+        int rc;
+        addr_t next = (addr_t)MM64_VA_PAGE_BASE(va) + MM64_PAGE_SIZE;
+
+        if (is_kernel) {
+            rc = pt_translate_va(caller, va, PT_KERNEL_WRITE, &t);
+            if (rc == PT_STATUS_SWAPPED)
+                rc = PT_STATUS_ERROR;
+        }
+        else {
+            rc = pt_translate_user_for_copy(caller, va, 1, &t);
+            if (rc == PT_STATUS_SWAPPED)
+                rc = PT_STATUS_OK;
+        }
+        if (rc != PT_STATUS_OK)
+            return rc;
+        if (next <= va)                           
+            break;
+        va = next;
+    }
+
+    /* 2. ghi 0 */
+    for (va = start; va < end; va++) {
+        addr_t phys;
+        int rc = pt_zero_byte_phys(caller, is_kernel, va, &phys);
+
+        if (rc != PT_STATUS_OK)
+            return rc;                               
+        if (MEMPHY_write(caller->krnl->mram, phys, 0) != 0)
+            return PT_STATUS_ERROR;
+        if (!is_kernel)
+            pt_update_access_flags(caller, va, 1);
+    }
+    return PT_STATUS_OK;
 }
 
 /*__read_user_mem - read value in user region memory

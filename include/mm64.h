@@ -374,4 +374,9 @@ static inline void pte_decode_info(mm64_pte_t pte, struct pt_mapping_info* mi)
 	mi->accessed = (pte & MM64_PTE_ACCESSED) != 0;
 	mi->dirty = (pte & MM64_PTE_DIRTY) != 0;
 }
+
+static inline addr_t pt_translation_phys(const struct pt_translation* t)
+{
+	return (addr_t)(((uint64_t)t->fpn << MM64_PAGE_SHIFT) | (uint64_t)t->offset);
+}
 #endif

@@ -884,6 +884,146 @@ int pt_unmap_one(struct pcb_t* caller, addr_t va, struct pt_mapping_info* old)
     return pt_unmap_one_mm(caller->mm, va, old);
 }
 
+enum pt_op { PT_OP_READ, PT_OP_WRITE, PT_OP_EXEC };
+
+static int pt_check_perm(mm64_pte_t pte, int kernel, enum pt_op op)
+{
+    if (!kernel && !(pte & MM64_PTE_USER))
+        return PT_STATUS_DENIED;
+    if (op == PT_OP_WRITE && !(pte & MM64_PTE_RW))
+        return PT_STATUS_DENIED;
+    if (op == PT_OP_EXEC) {
+        if (pte & MM64_PTE_NX)
+            return PT_STATUS_DENIED;
+        if (kernel && (pte & MM64_PTE_USER))
+            return PT_STATUS_DENIED;
+    }
+    return PT_STATUS_OK;
+}
+
+static int pt_translate_mm(struct mm_struct* mm, addr_t va, int kernel,
+    enum pt_op op, struct pt_translation* out)
+{
+    struct pt_walk w;
+    mm64_pte_t pte;
+    int rc;
+
+    if (mm == NULL || mm->pgd == NULL)
+        return PT_STATUS_ERROR;
+    if (!mm_is_canonical_va(va))
+        return PT_STATUS_INVALID_VA;
+
+    rc = pt_walk_internal((mm64_table_t*)mm->pgd, va, 0, &w);
+    if (rc != PT_STATUS_OK)
+        return rc;                                   /* UNMAPPED / ERROR */
+
+    pte = *w.pte;
+    switch (pte_decode_state(pte)) {
+    case PT_MAP_EMPTY:
+        return PT_STATUS_UNMAPPED;
+    case PT_MAP_INVALID:
+        return PT_STATUS_ERROR;
+    default:
+        break;
+    }
+
+    rc = pt_check_perm(pte, kernel, op);
+    if (rc != PT_STATUS_OK)
+        return rc;
+
+    if (out != NULL) {
+        out->offset = (uint16_t)MM64_VA_OFFSET(va);
+        if (pte & MM64_PTE_PRESENT) {
+            out->fpn = pte_decode_fpn(pte);
+            out->swptyp = 0;
+            out->swpoff = 0;
+        }
+        else {
+            out->fpn = 0;
+            out->swptyp = pte_decode_swptyp(pte);
+            out->swpoff = pte_decode_swpoff(pte);
+        }
+    }
+    return (pte & MM64_PTE_PRESENT) ? PT_STATUS_OK : PT_STATUS_SWAPPED;
+}
+
+int pt_translate_va(struct pcb_t* caller, addr_t va, enum pt_access_type access,
+    struct pt_translation* out)
+{
+    struct mm_struct* mm;
+    int kernel;
+    enum pt_op op;
+
+    if (caller == NULL)
+        return PT_STATUS_ERROR;
+
+    switch (access) {
+    case PT_USER_READ:    kernel = 0; op = PT_OP_READ;  break;
+    case PT_USER_WRITE:   kernel = 0; op = PT_OP_WRITE; break;
+    case PT_USER_EXEC:    kernel = 0; op = PT_OP_EXEC;  break;
+    case PT_KERNEL_READ:  kernel = 1; op = PT_OP_READ;  break;
+    case PT_KERNEL_WRITE: kernel = 1; op = PT_OP_WRITE; break;
+    case PT_KERNEL_EXEC:  kernel = 1; op = PT_OP_EXEC;  break;
+    default:
+        return PT_STATUS_INVALID_VA;
+    }
+
+    if (kernel)
+        mm = (caller->krnl != NULL) ? caller->krnl->mm : NULL;
+    else
+        mm = caller->mm;
+
+    return pt_translate_mm(mm, va, kernel, op, out);
+}
+
+int pt_translate_user_for_copy(struct pcb_t* caller, addr_t va, int is_write,
+    struct pt_translation* out)
+{
+    if (caller == NULL)
+        return PT_STATUS_ERROR;
+    return pt_translate_mm(caller->mm, va, 1,
+        is_write ? PT_OP_WRITE : PT_OP_READ, out);
+}
+
+int pt_update_access_flags(struct pcb_t* caller, addr_t va, int is_write)
+{
+    struct pt_walk w;
+    mm64_pte_t pte;
+    int rc;
+
+    if (caller == NULL || caller->mm == NULL || caller->mm->pgd == NULL)
+        return PT_STATUS_ERROR;
+    if (!mm_is_canonical_va(va))
+        return PT_STATUS_INVALID_VA;
+
+    rc = pt_walk_internal((mm64_table_t*)caller->mm->pgd, va, 0, &w);
+    if (rc != PT_STATUS_OK)
+        return rc;
+
+    pte = *w.pte;
+    switch (pte_decode_state(pte)) {
+    case PT_MAP_PRESENT:
+        break;
+    case PT_MAP_SWAPPED:
+        return PT_STATUS_SWAPPED;
+    case PT_MAP_EMPTY:
+        return PT_STATUS_UNMAPPED;
+    default:
+        return PT_STATUS_ERROR;
+    }
+
+    if (is_write) {
+        if (!(pte & MM64_PTE_RW))
+            return PT_STATUS_DENIED;
+        *w.pte = pte | MM64_PTE_ACCESSED | MM64_PTE_DIRTY;
+    }
+    else {
+        *w.pte = pte | MM64_PTE_ACCESSED;
+    }
+    return PT_STATUS_OK;
+}
+
+
 __attribute__((weak)) int mm_reclaim_global_user(struct pcb_t* caller, int need)
 {
     (void)caller; (void)need; return 0;

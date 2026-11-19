@@ -47,6 +47,26 @@ struct pt_mapping_info {
     bool dirty;
 };
 
+enum pt_access_type {
+    PT_USER_READ,
+    PT_USER_WRITE,
+    PT_USER_EXEC,
+
+    PT_KERNEL_READ,
+    PT_KERNEL_WRITE,
+    PT_KERNEL_EXEC
+};
+
+/* status PT_STATUS_OK      -> fpn, offset hợp lệ
+ * status PT_STATUS_SWAPPED -> swptyp, swpoff (và offset) hợp lệ */
+struct pt_translation {
+    addr_t fpn;
+    uint16_t offset;
+
+    int swptyp;
+    addr_t swpoff;
+};
+
 /* CPU Bus definition */
 #define PAGING_CPU_BUS_WIDTH 22 /* 22bit bus - MAX SPACE 4MB */
 #define PAGING_PAGESZ  256      /* 256B or 8-bits PAGE NUMBER */
@@ -166,8 +186,10 @@ int __read_user_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BY
 int __write_user_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE value);
 int __read_kernel_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE *data);
 int __write_kernel_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE value);
+int mm_region_is_active(struct mm_struct* mm, int vmaid, int rgid);
 
 /* Page directory prototypes */
+int mm_handle_swapped_page(struct pcb_t* caller, addr_t va);
 int mm_is_canonical_va(addr_t va);
 int pt_init_root(struct mm_struct* mm);
 int pt_destroy_tree(struct mm_struct* mm);
@@ -191,6 +213,9 @@ int __read(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE *data)
 int __write(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE value);
 int init_mm(struct mm_struct *mm, struct pcb_t *caller);
 int pt_unmap_one(struct pcb_t* caller, addr_t va, struct pt_mapping_info* old);
+int pt_update_access_flags(struct pcb_t* caller, addr_t va, int is_write);
+int pt_translate_user_for_copy(struct pcb_t* caller, addr_t va, int is_write, struct pt_translation* out);
+int vm_zero_allocated_range(struct pcb_t* caller, int is_kernel, addr_t start, addr_t end);
 
 /* VM prototypes */
 int pgalloc(struct pcb_t *proc, uint32_t size, uint32_t reg_index);
