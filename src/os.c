@@ -149,7 +149,7 @@ static void * ld_routine(void * args) {
 	int i = 0;
   /* TODO init kernel page table directory */
 #ifdef MM64
-	os.krnl_pgd = (addr_t*)malloc(PAGING64_MAX_PGN * sizeof(addr_t));
+	os.krnl_pgd = NULL;
 	os.krnl_p4d = NULL;
 	os.krnl_pud = NULL;
 	os.krnl_pmd = NULL;
@@ -164,6 +164,9 @@ static void * ld_routine(void * args) {
 	os.active_mswp = active_mswp;
 	os.mm = (struct mm_struct*)malloc(sizeof(struct mm_struct));
 	init_mm(os.mm, NULL);
+#ifdef MM64
+	os.krnl_pgd = os.mm->pgd;   /* Kernel PGD chung, alias */
+#endif
 	while (i < num_processes) {
 		struct pcb_t * proc = load(ld_processes.path[i]);
 		proc->krnl = &os;

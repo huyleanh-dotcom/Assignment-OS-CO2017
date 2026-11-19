@@ -313,4 +313,37 @@ static inline uint64_t pte_decode_ad(mm64_pte_t pte)
 {
 	return pte & MM64_PTE_AD_MASK;
 }
+
+
+ /* PHẦN H — INTERMEDIATE ENTRY HELPERS */ 
+static inline mm64_table_t* pde_child(mm64_pde_t e)
+{
+	return (mm64_table_t*)(uintptr_t)(e & MM64_PDE_ADDR_MASK);
+}
+
+static inline unsigned pde_count(mm64_pde_t e)
+{
+	return (unsigned)(e & MM64_PDE_COUNT_MASK);
+}
+
+static inline mm64_pde_t pde_make(const mm64_table_t* child, unsigned count)
+{
+	return (((uint64_t)(uintptr_t)child) & MM64_PDE_ADDR_MASK)
+		| ((uint64_t)count & MM64_PDE_COUNT_MASK);
+}
+
+/* 0 nếu entry rỗng hoặc hợp lệ; -1 nếu hỏng (bit dự trữ, count > 512,
+ * con trỏ NULL hoặc không căn 4096). */
+static inline int pde_validate(mm64_pde_t e)
+{
+	if (e == 0)
+		return 0;
+	if (e & MM64_PDE_RSVD_MASK)
+		return -1;
+	if (pde_count(e) > MM64_PDE_COUNT_MAX)
+		return -1;
+	if ((e & MM64_PDE_ADDR_MASK) == 0)
+		return -1;
+	return 0;
+}
 #endif

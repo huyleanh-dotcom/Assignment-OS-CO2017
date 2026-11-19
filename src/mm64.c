@@ -117,6 +117,274 @@ int get_pd_from_pagenum(addr_t pgn, addr_t* pgd, addr_t* p4d, addr_t* pud, addr_
     return get_pd_from_address(mm64_pgn_to_va(pgn), pgd, p4d, pud, pmd, pt);
 }
 
+static struct {
+    unsigned long live[MM64_PT_LEVELS];  /* số bảng đang sống theo cấp */
+    unsigned long allocs;
+    unsigned long frees;
+    unsigned long walks;
+} g_pt_stats;
+
+unsigned long pt_host_tables_live(void)
+{
+    unsigned long n = 0;
+    unsigned l;
+    for (l = 0; l < MM64_PT_LEVELS; l++)
+        n += g_pt_stats.live[l];
+    return n;
+}
+
+/*  * pt_table_alloc - Allocate a new page table for a given level
+ * @level: the level of the page table (0 for PGD, 1 for P4D, etc.)
+ * Return: pointer to the allocated page table, or NULL on failure
+ */
+static mm64_table_t* pt_table_alloc(unsigned level)
+{
+    mm64_table_t* t;
+
+    if (posix_memalign((void**)&t, MM64_PAGE_SIZE, sizeof(mm64_table_t)) != 0)
+        return NULL;
+
+    memset(t, 0, sizeof(*t));
+    g_pt_stats.live[level]++;
+    g_pt_stats.allocs++;
+    return t;
+}
+
+static void pt_table_free(mm64_table_t* t, unsigned level)
+{
+    if (t == NULL)
+        return;
+    free(t);
+    g_pt_stats.live[level]--;
+    g_pt_stats.frees++;
+}
+
+struct pt_walk {
+    mm64_table_t* tbl[MM64_PT_LEVELS]; /* tbl[0]=PGD ... tbl[4]=PT, NULL nếu chưa có */
+    unsigned      idx[MM64_PT_LEVELS]; /* chỉ số trong từng bảng                     */
+    unsigned      created;             /* bit l = 1: bảng cấp l do walk này tạo       */
+    mm64_pte_t* pte;                 /* &PT[idx[4]], NULL nếu chưa tới lá          */
+};
+
+/* pde_count - get count of a PDE entry
+ * @pde: the PDE entry
+ * Return: the count value (0..512)
+ */
+static int pt_count_inc(struct pt_walk* w, unsigned l)
+{
+    mm64_pde_t* pe;
+    unsigned c;
+
+    if (l == 0)
+        return 0;
+    pe = &w->tbl[l - 1]->entries[w->idx[l - 1]];
+    c = pde_count(*pe);
+    if (c >= MM64_PDE_COUNT_MAX)
+        return -1;                      
+    *pe = (*pe & ~MM64_PDE_COUNT_MASK) | (mm64_pde_t)(c + 1);
+    return 0;
+}
+
+static int pt_count_dec(struct pt_walk* w, unsigned l)
+{
+    mm64_pde_t* pe;
+    unsigned c;
+
+    if (l == 0)
+        return 0;
+    pe = &w->tbl[l - 1]->entries[w->idx[l - 1]];
+    c = pde_count(*pe);
+    if (c == 0)
+        return -1;                    
+    *pe = (*pe & ~MM64_PDE_COUNT_MASK) | (mm64_pde_t)(c - 1);
+    return 0;
+}
+
+/* pte_rollback_created_branches - recover branches */
+static int pt_rollback_created_branches(struct pt_walk* w)
+{
+    int l;
+
+    for (l = MM64_PT_LEVELS - 1; l >= 1; l--) {
+        mm64_pde_t* pe;
+
+        if (!(w->created & (1u << l)) || w->tbl[l] == NULL)
+            continue;
+
+        pe = &w->tbl[l - 1]->entries[w->idx[l - 1]];
+        if (pde_count(*pe) != 0)
+            return -1;
+
+        pt_table_free(w->tbl[l], (unsigned)l);
+        w->tbl[l] = NULL;
+        w->created &= ~(1u << l);
+        if (l == (int)MM64_LVL_PT)
+            w->pte = NULL;
+
+        *pe = 0;
+        pt_count_dec(w, (unsigned)(l - 1));
+    }
+    return 0;
+}
+
+/* pt_prune_empty - prune empty page tables after a PTE is cleared
+ * @w: the pt_walk structure after a PTE has been cleared
+ */
+static void pt_prune_empty(struct pt_walk* w)
+{
+    int l;
+
+    for (l = MM64_PT_LEVELS - 1; l >= 1; l--) {
+        mm64_pde_t* pe;
+
+        if (w->tbl[l] == NULL)
+            continue;                   
+
+        pe = &w->tbl[l - 1]->entries[w->idx[l - 1]];
+        if (pde_count(*pe) != 0)
+            break;                      
+
+        pt_table_free(w->tbl[l], (unsigned)l);
+        w->tbl[l] = NULL;
+        w->created &= ~(1u << l);
+        if (l == (int)MM64_LVL_PT)
+            w->pte = NULL;
+
+        *pe = 0;                      
+        pt_count_dec(w, (unsigned)(l - 1));
+    }
+}
+
+/* pt_walk_internal - Walk the page table to find the PTE for a given virtual address
+ * @root  : root page table (PGD)
+ * @va    : virtual address
+ * @create: if non-zero, create intermediate tables if they don't exist
+ * @w     : output structure to hold walk information
+ * Return: PT_STATUS_OK on success, or an error code
+ */
+static int pt_walk_internal(mm64_table_t* root, addr_t va, int create,
+    struct pt_walk* w)
+{
+    unsigned l;
+
+    memset(w, 0, sizeof(*w));
+    if (root == NULL)
+        return PT_STATUS_ERROR;
+    if (!mm_is_canonical_va(va))
+        return PT_STATUS_INVALID_VA;
+
+    for (l = 0; l < MM64_PT_LEVELS; l++)
+        w->idx[l] = (unsigned)MM64_VA_INDEX(va, l);
+    w->tbl[0] = root;
+    g_pt_stats.walks++;
+
+    for (l = 0; l < MM64_PT_LEVELS - 1; l++) {
+        mm64_pde_t* e = &w->tbl[l]->entries[w->idx[l]];
+
+        if (*e == 0) {
+            mm64_table_t* child;
+
+            if (!create)
+                return PT_STATUS_UNMAPPED;
+
+            child = pt_table_alloc(l + 1);
+            if (child == NULL) {
+                pt_rollback_created_branches(w);
+                return PT_STATUS_ERROR;
+            }
+            *e = pde_make(child, 0);
+            w->created |= 1u << (l + 1);
+            if (pt_count_inc(w, l) != 0) {
+                pt_rollback_created_branches(w);
+                return PT_STATUS_ERROR;
+            }
+        }
+        else if (pde_validate(*e) != 0) {
+            pt_rollback_created_branches(w);
+            return PT_STATUS_ERROR;
+        }
+
+        w->tbl[l + 1] = pde_child(*e);
+    }
+
+    w->pte = &w->tbl[MM64_LVL_PT]->entries[w->idx[MM64_LVL_PT]];
+    return PT_STATUS_OK;
+}
+
+static struct mm_struct* pt_resolve_mm(struct mm_struct* mm, struct pcb_t* caller)
+{
+    if (mm != NULL)
+        return mm;
+    return (caller != NULL) ? caller->mm : NULL;
+}
+
+static int pt_is_kernel_mm(struct mm_struct* mm, struct pcb_t* caller)
+{
+    return caller != NULL && caller->krnl != NULL && mm == caller->krnl->mm;
+}
+
+/* -------- root ------------------------------------------------------- */
+
+/* pte_encode_swapped - tạo Leaf PTE SWAPPED
+ * @swptyp : swap type
+ * @swpoff : swap offset
+ * @flags  : tập con của RW | USER | NX
+ * @out    : nơi lưu kết quả
+ */
+int pt_init_root(struct mm_struct* mm)
+{
+    mm64_table_t* root;
+
+    if (mm == NULL)
+        return PT_STATUS_ERROR;
+
+    root = pt_table_alloc(MM64_LVL_PGD);
+    if (root == NULL)
+        return PT_STATUS_ERROR;
+
+    mm->pgd = (addr_t*)root;
+    mm->p4d = NULL;
+    mm->pud = NULL;
+    mm->pmd = NULL;
+    mm->pt = NULL;
+    return PT_STATUS_OK;
+}
+
+/* pt_destroy_level - recursively destroy a page table level
+ * @t    : the page table to destroy
+ * @level: the level of the page table (0 for PGD, 1 for P4D, etc.)
+ */
+static void pt_destroy_level(mm64_table_t* t, unsigned level)
+{
+    unsigned i;
+
+    if (level < MM64_LVL_PT) {
+        for (i = 0; i < MM64_PT_ENTRIES; i++) {
+            mm64_pde_t e = t->entries[i];
+            if (e == 0)
+                continue;
+            if (pde_validate(e) != 0)
+				continue;                    // skip invalid entries
+            pt_destroy_level(pde_child(e), level + 1);
+        }
+    }
+    pt_table_free(t, level);
+}
+
+/* pt_destroy_tree - destroy the entire page table tree for a given mm_struct
+ * @mm: the mm_struct whose page table tree to destroy
+ * Return: PT_STATUS_OK on success, PT_STATUS_ERROR on failure
+ */
+int pt_destroy_tree(struct mm_struct* mm)
+{
+    if (mm == NULL)
+        return PT_STATUS_ERROR;
+    if (mm->pgd != NULL)
+        pt_destroy_level((mm64_table_t*)mm->pgd, MM64_LVL_PGD);
+    mm->pgd = NULL;
+    return PT_STATUS_OK;
+}
+
 
 /*
  * pte_set_swap - Set PTE entry for swapped page
@@ -138,12 +406,32 @@ int pte_set_swap(struct pcb_t *caller, addr_t pgn, int swptyp, addr_t swpoff)
   // dummy pte alloc to avoid runtime error
   pte = malloc(sizeof(addr_t));
 #ifdef MM64	
-  /* Get value from the system */
-  /* TODO Perform multi-level page mapping */
-  get_pd_from_pagenum(pgn, &pgd, &p4d, &pud, &pmd, &pt);
-  //... krnl->mm->pgd
-  //... krnl->mm->pt
-  //pte = &krnl->mm->pt;
+  struct mm_struct* mm;
+  mm64_pte_t old, val;
+
+  if (caller == NULL || caller->mm == NULL)
+      return PT_STATUS_ERROR;
+  mm = caller->mm;
+  if (pt_is_kernel_mm(mm, caller))
+      return PT_STATUS_DENIED;
+  if ((uint64_t)pgn > MM64_PGN_MAX)
+      return PT_STATUS_INVALID_VA;
+
+  old = (mm64_pte_t)pte_get_entry(mm, pgn, caller);
+  switch (pte_decode_state(old)) {
+  case PT_MAP_PRESENT:
+      break;
+  case PT_MAP_EMPTY:
+      return PT_STATUS_UNMAPPED;
+  default:
+      return PT_STATUS_ERROR;          /* SWAPPED sẵn hoặc INVALID */
+  }
+  if (!(old & MM64_PTE_USER))
+      return PT_STATUS_DENIED;
+
+  if (pte_encode_swapped(swptyp, swpoff, pte_decode_perm(old), &val) != 0)
+      return PT_STATUS_ERROR;
+  return pte_set_entry(mm, pgn, val, caller);
 #else
   pte = &krnl->mm->pgd[pgn];
 #endif
@@ -177,12 +465,34 @@ int pte_set_fpn(struct mm_struct *mm, addr_t pgn, addr_t fpn, struct pcb_t *call
   // dummy pte alloc to avoid runtime error
   pte = malloc(sizeof(addr_t));
 #ifdef MM64	
-  /* Get value from the system */
-  /* TODO Perform multi-level page mapping */
-  get_pd_from_pagenum(pgn, &pgd, &p4d, &pud, &pmd, &pt);
-  //... krnl->mm->pgd
-  //... krnl->mm->pt
-  //pte = &krnl->mm->pt;
+  mm64_pte_t old, val;
+  uint64_t perm;
+
+  if (caller == NULL)
+      return PT_STATUS_ERROR;
+  mm = pt_resolve_mm(mm, caller);
+  if (mm == NULL)
+      return PT_STATUS_ERROR;
+  if ((uint64_t)pgn > MM64_PGN_MAX)
+      return PT_STATUS_INVALID_VA;
+
+  old = (mm64_pte_t)pte_get_entry(mm, pgn, caller);
+  switch (pte_decode_state(old)) {
+  case PT_MAP_EMPTY:
+      perm = (pt_is_kernel_mm(mm, caller) ? MM64_PTE_DEFAULT_KERNEL
+          : MM64_PTE_DEFAULT_USER) & MM64_PTE_PERM_MASK;
+      break;
+  case PT_MAP_PRESENT:
+  case PT_MAP_SWAPPED:
+      perm = pte_decode_perm(old);
+      break;
+  default:
+      return PT_STATUS_ERROR;
+  }
+
+  if (pte_encode_present(fpn, perm, &val) != 0)
+      return PT_STATUS_ERROR;
+  return pte_set_entry(mm, pgn, val, caller);
 #else
   pte = &krnl->mm->pgd[pgn];
 #endif
@@ -216,14 +526,17 @@ addr_t pte_get_entry(struct mm_struct *mm, addr_t pgn, struct pcb_t *caller)
   // dummy pte alloc to avoid runtime error
   pte = malloc(sizeof(addr_t));
 #ifdef MM64	
-  /* Get value from the system */
-  /* TODO Perform multi-level page mapping */
-  get_pd_from_pagenum(pgn, &pgd, &p4d, &pud, &pmd, &pt);
-  //... krnl->mm->pgd
-  //... krnl->mm->pt
-  //pte = &krnl->mm->pt;
-#else	
-  pte = &krnl->mm->pgd[pgn];
+  struct pt_walk w;
+
+  mm = pt_resolve_mm(mm, caller);
+  if (mm == NULL || (uint64_t)pgn > MM64_PGN_MAX)
+      return 0;
+
+  if (pt_walk_internal((mm64_table_t*)mm->pgd, mm64_pgn_to_va(pgn), 0, &w)
+      != PT_STATUS_OK)
+      return 0;
+
+  return (addr_t)*w.pte;
 #endif
 
   return (addr_t) &pte;
@@ -248,12 +561,59 @@ int pte_set_entry(struct mm_struct *mm, addr_t pgn, uint64_t pte_val, struct pcb
   // dummy pte alloc to avoid runtime error
   pte = malloc(sizeof(addr_t));
 #ifdef MM64	
-  /* Get value from the system */
-  /* TODO Perform multi-level page mapping */
-  get_pd_from_pagenum(pgn, &pgd, &p4d, &pud, &pmd, &pt);
-  //... krnl->mm->pgd
-  //... krnl->mm->pt
-  //pte = &krnl->mm->pt;
+  struct pt_walk w;
+  enum pt_mapping_state new_st, old_st;
+  int rc;
+
+  mm = pt_resolve_mm(mm, caller);
+  if (mm == NULL || mm->pgd == NULL)
+      return PT_STATUS_ERROR;
+  if ((uint64_t)pgn > MM64_PGN_MAX)
+      return PT_STATUS_INVALID_VA;
+
+  new_st = pte_decode_state((mm64_pte_t)pte_val);
+  if (new_st == PT_MAP_INVALID)
+      return PT_STATUS_ERROR;
+
+  /* ---- xóa mapping ---- */
+  if (new_st == PT_MAP_EMPTY) {
+      rc = pt_walk_internal((mm64_table_t*)mm->pgd, mm64_pgn_to_va(pgn), 0, &w);
+      if (rc == PT_STATUS_UNMAPPED)
+          return PT_STATUS_OK;
+      if (rc != PT_STATUS_OK)
+          return rc;
+      if (*w.pte == 0)
+          return PT_STATUS_OK;
+
+      if (pde_count(w.tbl[MM64_LVL_PMD]->entries[w.idx[MM64_LVL_PMD]]) == 0)
+          return PT_STATUS_ERROR;
+
+      *w.pte = 0;
+      if (pt_count_dec(&w, MM64_LVL_PT) != 0)
+          return PT_STATUS_ERROR;
+      pt_prune_empty(&w);
+      return PT_STATUS_OK;
+  }
+
+  /* ---- tạo / cập nhật mapping ---- */
+  rc = pt_walk_internal((mm64_table_t*)mm->pgd, mm64_pgn_to_va(pgn), 1, &w);
+  if (rc != PT_STATUS_OK)
+      return rc;
+
+  old_st = pte_decode_state(*w.pte);
+  if (old_st == PT_MAP_INVALID) {
+      pt_rollback_created_branches(&w);
+      return PT_STATUS_ERROR;
+  }
+
+  if (old_st == PT_MAP_EMPTY) {
+      if (pt_count_inc(&w, MM64_LVL_PT) != 0) {
+          pt_rollback_created_branches(&w);
+          return PT_STATUS_ERROR;
+      }
+  }
+  *w.pte = (mm64_pte_t)pte_val;
+  return PT_STATUS_OK;
 #else	
   pte = pte_val;
 #endif

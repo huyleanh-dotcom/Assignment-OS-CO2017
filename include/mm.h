@@ -8,6 +8,24 @@
 extern "C" {
 #endif
 
+/* memory mapping states */
+enum pt_mapping_state {
+    PT_MAP_EMPTY,
+    PT_MAP_PRESENT,
+    PT_MAP_SWAPPED,
+    PT_MAP_INVALID
+};
+/* page table status */
+enum pt_status {
+    PT_STATUS_OK = 0,
+    PT_STATUS_SWAPPED = 1,
+
+    PT_STATUS_UNMAPPED = -1,
+    PT_STATUS_DENIED = -2,
+    PT_STATUS_INVALID_VA = -3,
+    PT_STATUS_ERROR = -4
+}
+
 /* CPU Bus definition */
 #define PAGING_CPU_BUS_WIDTH 22 /* 22bit bus - MAX SPACE 4MB */
 #define PAGING_PAGESZ  256      /* 256B or 8-bits PAGE NUMBER */
@@ -126,6 +144,10 @@ int __read_kernel_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, 
 int __write_kernel_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE value);
 
 /* Page directory prototypes */
+int mm_is_canonical_va(addr_t va);
+int pt_init_root(struct mm_struct* mm);
+int pt_destroy_tree(struct mm_struct* mm);
+unsigned long pt_host_tables_live(void);
 int get_pd_from_address(addr_t addr, addr_t* pgd, addr_t* p4d, addr_t* pud, addr_t* pmd, addr_t* pt);
 int get_pd_from_pagenum(addr_t pgn, addr_t* pgd, addr_t* p4d, addr_t* pud, addr_t* pmd, addr_t* pt);
 int pte_set_fpn(struct mm_struct *mm, addr_t pgn, addr_t fpn,struct pcb_t *caller);
