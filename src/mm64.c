@@ -32,30 +32,46 @@ int init_pte(addr_t *pte,
              int swptyp, // swap type
              addr_t swpoff) // swap offset
 {
-  if (pre != 0) {
-    if (swp == 0) { // Non swap ~ page online
-      if (fpn == 0)
-        return -1;  // Invalid setting
+    mm64_pte_t val;
+    const uint64_t perm = MM64_PTE_DEFAULT_USER & MM64_PTE_PERM_MASK;
 
-      /* Valid setting with FPN */
-      SETBIT(*pte, PAGING_PTE_PRESENT_MASK);
-      CLRBIT(*pte, PAGING_PTE_SWAPPED_MASK);
-      CLRBIT(*pte, PAGING_PTE_DIRTY_MASK);
+    if (pte == NULL)
+        return -1;
 
-      SETVAL(*pte, fpn, PAGING_PTE_FPN_MASK, PAGING_PTE_FPN_LOBIT);
+    if (pre != 0 && swp != 0)
+        return -1;
+
+
+    if (swp != 0) {
+        /* SWAPPED không lưu ACCESSED/DIRTY (đã chốt ở việc 1.2) */
+        if (drt != 0)
+            return -1;
+        if (pte_encode_swapped(swptyp, swpoff, perm, &val) != 0)
+            return -1;
     }
-    else
-    { // page swapped
-      SETBIT(*pte, PAGING_PTE_PRESENT_MASK);
-      SETBIT(*pte, PAGING_PTE_SWAPPED_MASK);
-      CLRBIT(*pte, PAGING_PTE_DIRTY_MASK);
-
-      SETVAL(*pte, swptyp, PAGING_PTE_SWPTYP_MASK, PAGING_PTE_SWPTYP_LOBIT);
-      SETVAL(*pte, swpoff, PAGING_PTE_SWPOFF_MASK, PAGING_PTE_SWPOFF_LOBIT);
+    else if (pre != 0) {
+        uint64_t flags = perm | (drt ? MM64_PTE_DIRTY : 0);
+        if (pte_encode_present(fpn, flags, &val) != 0)
+            return -1;
     }
-  }
+    else {
+        val = 0;  /* EMPTY */
+    }
 
-  return 0;
+    *pte = (addr_t)val;
+    return 0;
+}
+
+/*
+ * mm_is_canonical_va - Check if a virtual address is canonical
+ * @va: virtual address
+ * Return: 1 if canonical, 0 otherwise
+ */
+
+int mm_is_canonical_va(addr_t va)
+{
+    uint64_t top = ((uint64_t)va) >> MM64_VA_SIGN_BIT;   /* bits 63..56 */
+    return (top == 0) || (top == 0xFFULL);
 }
 
 
@@ -70,16 +86,18 @@ int init_pte(addr_t *pte,
  */
 int get_pd_from_address(addr_t addr, addr_t* pgd, addr_t* p4d, addr_t* pud, addr_t* pmd, addr_t* pt)
 {
-	/* Extract page direactories */
-	*pgd = (addr&PAGING64_ADDR_PGD_MASK)>>PAGING64_ADDR_PGD_LOBIT;
-	*p4d = (addr&PAGING64_ADDR_P4D_MASK)>>PAGING64_ADDR_P4D_LOBIT;
-	*pud = (addr&PAGING64_ADDR_PUD_MASK)>>PAGING64_ADDR_PUD_LOBIT;
-	*pmd = (addr&PAGING64_ADDR_PMD_MASK)>>PAGING64_ADDR_PMD_LOBIT;
-	*pt = (addr&PAGING64_ADDR_PT_MASK)>>PAGING64_ADDR_PT_LOBIT;
+    if (!pgd || !p4d || !pud || !pmd || !pt)
+        return -1;
+    if (!mm_is_canonical_va(addr))
+        return -1;
 
-	/* TODO: implement the page direactories mapping */
+    *pgd = (addr_t)MM64_VA_INDEX(addr, MM64_LVL_PGD);
+    *p4d = (addr_t)MM64_VA_INDEX(addr, MM64_LVL_P4D);
+    *pud = (addr_t)MM64_VA_INDEX(addr, MM64_LVL_PUD);
+    *pmd = (addr_t)MM64_VA_INDEX(addr, MM64_LVL_PMD);
+    *pt = (addr_t)MM64_VA_INDEX(addr, MM64_LVL_PT);
 
-	return 0;
+    return 0;
 }
 
 /*
@@ -93,9 +111,10 @@ int get_pd_from_address(addr_t addr, addr_t* pgd, addr_t* p4d, addr_t* pud, addr
  */
 int get_pd_from_pagenum(addr_t pgn, addr_t* pgd, addr_t* p4d, addr_t* pud, addr_t* pmd, addr_t* pt)
 {
-	/* Shift the address to get page num and perform the mapping*/
-	return get_pd_from_address(pgn << PAGING64_ADDR_PT_SHIFT,
-                         pgd,p4d,pud,pmd,pt);
+    if ((uint64_t)pgn > MM64_PGN_MAX)
+        return -1;
+
+    return get_pd_from_address(mm64_pgn_to_va(pgn), pgd, p4d, pud, pmd, pt);
 }
 
 
