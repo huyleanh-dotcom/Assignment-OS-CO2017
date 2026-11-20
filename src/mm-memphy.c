@@ -16,6 +16,7 @@
 
 #include "mm.h"
 #include "mm64.h"
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,15 +28,13 @@
  */
 int MEMPHY_mv_csr(struct memphy_struct *mp, addr_t offset)
 {
-   int numstep = 0;
+   if (mp == NULL || mp->rdmflg || mp->maxsz <= 0)
+      return -1;
 
-   mp->cursor = 0;
-   while (numstep < offset && numstep < mp->maxsz)
-   {
-      /* Traverse sequentially */
-      mp->cursor = (mp->cursor + 1) % mp->maxsz;
-      numstep++;
-   }
+   if (offset >= (addr_t)mp->maxsz)
+      return -1;
+
+   mp->cursor = (int)offset;
 
    return 0;
 }
@@ -48,13 +47,15 @@ int MEMPHY_mv_csr(struct memphy_struct *mp, addr_t offset)
  */
 int MEMPHY_seq_read(struct memphy_struct *mp, addr_t addr, BYTE *value)
 {
-   if (mp == NULL)
+   if (mp == NULL || value == NULL || mp->storage == NULL || mp->maxsz <= 0)
       return -1;
 
-   if (!mp->rdmflg)
+   if (mp->rdmflg || addr >= (addr_t)mp->maxsz)
       return -1; /* Not compatible mode for sequential read */
+      /*rdmflg = 0 for seq and = 1 for RAM*/
+   if (MEMPHY_mv_csr(mp, addr) != 0)
+      return -1;
 
-   MEMPHY_mv_csr(mp, addr);
    *value = (BYTE)mp->storage[addr];
 
    return 0;
@@ -68,9 +69,13 @@ int MEMPHY_seq_read(struct memphy_struct *mp, addr_t addr, BYTE *value)
  */
 int MEMPHY_read(struct memphy_struct *mp, addr_t addr, BYTE *value)
 {
-   if (mp == NULL)
+   if (mp == NULL || value == NULL || mp->storage == NULL || mp->maxsz <= 0)
       return -1;
 
+   if (addr >= (addr_t)mp->maxsz)
+      return -1;
+
+   /* rdmflg = 0 for seq and = 1 for RAM */
    if (mp->rdmflg)
       *value = mp->storage[addr];
    else /* Sequential access device */
@@ -87,14 +92,15 @@ int MEMPHY_read(struct memphy_struct *mp, addr_t addr, BYTE *value)
  */
 int MEMPHY_seq_write(struct memphy_struct *mp, addr_t addr, BYTE value)
 {
-
-   if (mp == NULL)
+   if (mp == NULL || mp->storage == NULL || mp->maxsz <= 0)
       return -1;
 
-   if (!mp->rdmflg)
-      return -1; /* Not compatible mode for sequential read */
+   if (mp->rdmflg || addr >= (addr_t)mp->maxsz)
+      return -1; /* Not compatible mode for sequential write */
+      /*rdmflg = 0 for seq and = 1 for RAM*/
+   if (MEMPHY_mv_csr(mp, addr) != 0)
+      return -1;
 
-   MEMPHY_mv_csr(mp, addr);
    mp->storage[addr] = value;
 
    return 0;
@@ -108,7 +114,10 @@ int MEMPHY_seq_write(struct memphy_struct *mp, addr_t addr, BYTE value)
  */
 int MEMPHY_write(struct memphy_struct *mp, addr_t addr, BYTE data)
 {
-   if (mp == NULL)
+   if (mp == NULL || mp->storage == NULL || mp->maxsz <= 0)
+      return -1;
+
+   if (addr >= (addr_t)mp->maxsz)
       return -1;
 
    if (mp->rdmflg)
@@ -125,50 +134,65 @@ int MEMPHY_write(struct memphy_struct *mp, addr_t addr, BYTE data)
  */
 int MEMPHY_format(struct memphy_struct *mp, int pagesz)
 {
-   /* This setting come with fixed constant PAGESZ */
-   int numfp = mp->maxsz / pagesz;
-   struct framephy_struct *newfst, *fst;
-   int iter = 0;
+   struct framephy_struct *head = NULL;
+   struct framephy_struct *tail = NULL;
+   int numfp;
+   int iter;
 
-   if (numfp <= 0)
+   if (mp == NULL || pagesz <= 0 || mp->maxsz < 0)
       return -1;
 
-   /* Init head of free framephy list */
-   fst = malloc(sizeof(struct framephy_struct));
-   fst->fpn = iter;
-   mp->free_fp_list = fst;
+   /* Formatting starts with no allocated frame.  A device smaller than one
+    * page (including a disabled, zero-sized swap device) is valid, but has no
+    * frame to offer. */
+   mp->free_fp_list = NULL;
+   mp->used_fp_list = NULL;
+   numfp = mp->maxsz / pagesz;
 
-   /* We have list with first element, fill in the rest num-1 element member*/
-   for (iter = 1; iter < numfp; iter++)
+   for (iter = 0; iter < numfp; iter++)
    {
-      newfst = malloc(sizeof(struct framephy_struct));
-      newfst->fpn = iter;
-      newfst->fp_next = NULL;
-      fst->fp_next = newfst;
-      fst = newfst;
+      struct framephy_struct *frame = calloc(1, sizeof(*frame));
+
+      if (frame == NULL)
+      {
+         while (head != NULL)
+         {
+            struct framephy_struct *next = head->fp_next;
+            free(head);
+            head = next;
+         }
+         return -1;
+      }
+
+      frame->fpn = (addr_t)iter;
+      frame->owner = NULL;
+
+      if (tail == NULL)
+         head = frame;
+      else
+         tail->fp_next = frame;
+      tail = frame;
    }
+
+   mp->free_fp_list = head;
 
    return 0;
 }
 
 int MEMPHY_get_freefp(struct memphy_struct *mp, addr_t *retfpn)
 {
-   struct framephy_struct *fp = mp->free_fp_list;
+   struct framephy_struct *fp;
 
-   if (fp == NULL)
+   if (mp == NULL || retfpn == NULL || mp->free_fp_list == NULL)
       return -1;
 
-   /* 
-    * TODO manage free frame list
-    */
-   //*retfpn ..
-   // cap nhat lai danh sach free frame
+   fp = mp->free_fp_list;
+   mp->free_fp_list = fp->fp_next;
 
-   /* 
-    * TODO MEMPHY is iteratively used up until its exhausted
-    * No garbage collector acting then it not been released
-    */
-   free(fp);
+   /* Keep the allocated frame node for ownership tracking and cleanup. */
+   fp->fp_next = mp->used_fp_list;
+   mp->used_fp_list = fp;
+   *retfpn = fp->fpn;
 
    return 0;
 }
@@ -185,13 +209,31 @@ int MEMPHY_dump(struct memphy_struct *mp)
 
 int MEMPHY_put_freefp(struct memphy_struct *mp, addr_t fpn)
 {
-   struct framephy_struct *fp = mp->free_fp_list;
-   struct framephy_struct *newnode = malloc(sizeof(struct framephy_struct));
+   struct framephy_struct *frame;
+   struct framephy_struct *previous = NULL;
 
-   /* Create new node with value fpn */
-   newnode->fpn = fpn;
-   newnode->fp_next = fp;
-   mp->free_fp_list = newnode;
+   if (mp == NULL)
+      return -1;
+
+   frame = mp->used_fp_list;
+   while (frame != NULL && frame->fpn != fpn)
+   {
+      previous = frame;
+      frame = frame->fp_next;
+   }
+
+   /* A frame not present in the used list is invalid or already free. */
+   if (frame == NULL)
+      return -1;
+
+   if (previous == NULL)
+      mp->used_fp_list = frame->fp_next;
+   else
+      previous->fp_next = frame->fp_next;
+
+   frame->owner = NULL;
+   frame->fp_next = mp->free_fp_list;
+   mp->free_fp_list = frame;
 
    return 0;
 }
@@ -201,20 +243,46 @@ int MEMPHY_put_freefp(struct memphy_struct *mp, addr_t fpn)
  */
 int init_memphy(struct memphy_struct *mp, addr_t max_size, int randomflg)
 {
-   mp->storage = (BYTE *)malloc(max_size * sizeof(BYTE));
-   mp->maxsz = max_size;
-   memset(mp->storage, 0, max_size * sizeof(BYTE));
+   int format_status;
+
+   if (mp == NULL)
+      return -1;
+
+   mp->storage = NULL;
+   mp->maxsz = 0;
+   mp->rdmflg = (randomflg != 0) ? 1 : 0;
+   mp->cursor = 0;
+   mp->free_fp_list = NULL;
+   mp->used_fp_list = NULL;
+
+   /* maxsz is currently an int field, so reject values it cannot represent. */
+   if (max_size > (addr_t)INT_MAX)
+      return -1;
+
+   mp->maxsz = (int)max_size;
+   if (max_size > 0)
+   {
+      mp->storage = calloc((size_t)max_size, sizeof(BYTE));
+      if (mp->storage == NULL)
+      {
+         mp->maxsz = 0;
+         return -1;
+      }
+   }
 
 #ifdef MM64
-   MEMPHY_format(mp, PAGING64_PAGESZ);
+   format_status = MEMPHY_format(mp, PAGING64_PAGESZ);
 #else
-   MEMPHY_format(mp, PAGING_PAGESZ);
+   format_status = MEMPHY_format(mp, PAGING_PAGESZ);
 #endif
 
-   mp->rdmflg = (randomflg != 0) ? 1 : 0;
-
-   if (!mp->rdmflg) /* Not Ramdom acess device, then it serial device*/
-      mp->cursor = 0;
+   if (format_status != 0)
+   {
+      free(mp->storage);
+      mp->storage = NULL;
+      mp->maxsz = 0;
+      return -1;
+   }
 
    return 0;
 }

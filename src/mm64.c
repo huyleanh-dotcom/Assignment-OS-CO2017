@@ -398,23 +398,32 @@ addr_t vm_map_ram(struct pcb_t *caller, addr_t astart, addr_t aend, addr_t mapst
 int __swap_cp_page(struct memphy_struct *mpsrc, addr_t srcfpn,
                    struct memphy_struct *mpdst, addr_t dstfpn)
 {
-  int cellidx;
-  addr_t addrsrc, addrdst;
-#ifdef MM64
-  for (cellidx = 0; cellidx < PAGING64_PAGESZ; cellidx++)
-  {
-    addrsrc = srcfpn * PAGING64_PAGESZ + cellidx;
-    addrdst = dstfpn * PAGING64_PAGESZ + cellidx;
-#else
-  for (cellidx = 0; cellidx < PAGING64_PAGESZ; cellidx++)
-  {
-    addrsrc = srcfpn * PAGING64_PAGESZ + cellidx;
-    addrdst = dstfpn * PAGING64_PAGESZ + cellidx;
-#endif
+  addr_t addrsrc;
+  addr_t addrdst;
+  addr_t cellidx;
 
+  if (mpsrc == NULL || mpdst == NULL
+      || mpsrc->storage == NULL || mpdst->storage == NULL
+      || mpsrc->maxsz < PAGING64_PAGESZ
+      || mpdst->maxsz < PAGING64_PAGESZ)
+    return -1;
+
+  /* Check frame bounds before multiplication so an invalid FPN cannot wrap. */
+  if (srcfpn >= (addr_t)mpsrc->maxsz / PAGING64_PAGESZ
+      || dstfpn >= (addr_t)mpdst->maxsz / PAGING64_PAGESZ)
+    return -1;
+
+  addrsrc = srcfpn * PAGING64_PAGESZ;
+  addrdst = dstfpn * PAGING64_PAGESZ;
+
+  for (cellidx = 0; cellidx < PAGING64_PAGESZ; cellidx++)
+  {
     BYTE data;
-    MEMPHY_read(mpsrc, addrsrc, &data);
-    MEMPHY_write(mpdst, addrdst, data);
+
+    if (MEMPHY_read(mpsrc, addrsrc + cellidx, &data) != 0)
+      return -1;
+    if (MEMPHY_write(mpdst, addrdst + cellidx, data) != 0)
+      return -1;
   }
 
   return 0;
