@@ -58,6 +58,10 @@ struct vm_rg_struct {
    addr_t rg_start;
    addr_t rg_end;
 
+   /* 1 = vung dang duoc dung, 0 = da free / chua cap.
+    * set khi alloc, clear khi free; read/write kiem tra truoc khi truy cap frame */
+   int active;
+
    struct vm_rg_struct *rg_next;
 };
 
@@ -80,8 +84,15 @@ struct vm_area_struct {
 };
 
 
-/* 
- * Kernel cache pool struct
+/* node theo doi mot slot kernel-heap trong (theo kernel VA).
+ * Slot nam o dia chi kernel khong deref duoc tu host nen free list giu o day. */
+struct kmem_slot_node {
+   addr_t kva;
+   struct kmem_slot_node *next;
+};
+
+/*
+ * Kernel cache pool struct - pool slot co dinh kich thuoc, grow theo chunk.
  */
 struct kcache_pool_struct {
    int size;
@@ -92,6 +103,10 @@ struct kcache_pool_struct {
 #else
    uint32_t storage;
 #endif
+
+   /* pool slot co dinh, cap phat dong (slab-like) */
+   int slots_per_chunk;
+   struct kmem_slot_node *free_list;
 };
 
 

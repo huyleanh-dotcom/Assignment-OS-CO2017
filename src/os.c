@@ -32,6 +32,78 @@ static int num_cpus;
 static int done = 0;
 static struct krnl_t os;
 
+/* Global MM lock + registry PID->PCB.
+ * De o day (khong o krnl_t) vi dua pthread_mutex_t vao common.h gay vong
+ * include voi sched.h. Tach biet voi queue_lock cua scheduler. */
+pthread_mutex_t os_mm_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* kernel base macOS-style (khong phai Linux 0xFFFF8000...) */
+#define KERNEL_BASE_ADDR 0xFFFFFF8000000000UL
+unsigned long kernel_base = KERNEL_BASE_ADDR;
+
+int registry_register(struct krnl_t *krnl, struct pcb_t *proc)
+{
+	if (krnl == NULL || proc == NULL) return -1;
+	pthread_mutex_lock(&os_mm_lock);
+	int i, slot = proc->pid % MAX_PROC;
+	for (i = 0; i < MAX_PROC; i++) {
+		int idx = (slot + i) % MAX_PROC;
+		if (krnl->pid_table[idx] == NULL) { krnl->pid_table[idx] = proc; pthread_mutex_unlock(&os_mm_lock); return 0; }
+		if (krnl->pid_table[idx]->pid == proc->pid) { pthread_mutex_unlock(&os_mm_lock); return -1; }
+	}
+	pthread_mutex_unlock(&os_mm_lock);
+	return -1;
+}
+
+struct pcb_t *registry_lookup(struct krnl_t *krnl, uint32_t pid)
+{
+	if (krnl == NULL) return NULL;
+	pthread_mutex_lock(&os_mm_lock);
+	int i, slot = pid % MAX_PROC;
+	struct pcb_t *found = NULL;
+	for (i = 0; i < MAX_PROC; i++) {
+		int idx = (slot + i) % MAX_PROC;
+		if (krnl->pid_table[idx] == NULL) break;
+		if (krnl->pid_table[idx]->pid == pid) { found = krnl->pid_table[idx]; break; }
+	}
+	pthread_mutex_unlock(&os_mm_lock);
+	return found;
+}
+
+int registry_unregister(struct krnl_t *krnl, uint32_t pid)
+{
+	if (krnl == NULL) return -1;
+	pthread_mutex_lock(&os_mm_lock);
+	int i, slot = pid % MAX_PROC;
+	for (i = 0; i < MAX_PROC; i++) {
+		int idx = (slot + i) % MAX_PROC;
+		if (krnl->pid_table[idx] == NULL) break;
+		if (krnl->pid_table[idx]->pid == pid) { krnl->pid_table[idx] = NULL; pthread_mutex_unlock(&os_mm_lock); return 0; }
+	}
+	pthread_mutex_unlock(&os_mm_lock);
+	return -1;
+}
+
+/* don dep tap trung khi process exit: go registry roi giai phong user mm */
+void kernel_cleanup_process(struct pcb_t *proc)
+{
+	if (proc == NULL) return;
+	registry_unregister(&os, proc->pid);
+	/* P1 them pt_destroy_tree(proc->mm); P3 them free_pcb_memph(proc) tai day */
+	if (proc->mm != NULL) {
+		struct vm_area_struct *vma = proc->mm->mmap;
+		while (vma != NULL) {
+			struct vm_area_struct *nextvma = vma->vm_next;
+			struct vm_rg_struct *rg = vma->vm_freerg_list;
+			while (rg != NULL) { struct vm_rg_struct *n = rg->rg_next; free(rg); rg = n; }
+			free(vma);
+			vma = nextvma;
+		}
+		free(proc->mm);
+		proc->mm = NULL;
+	}
+}
+
 #ifdef MM_PAGING
 static unsigned long memramsz;
 static unsigned long memswpsz[PAGING_MAX_MMSWP];
@@ -82,6 +154,7 @@ static void * cpu_routine(void * args) {
 			printf("\tCPU %d: Processed %2d has finished\n",
 				id ,proc->pid);
 			finish_proc(proc);
+			kernel_cleanup_process(proc);   /* don dep mm + registry */
 			free(proc);
 			proc = get_proc();
 			time_left = 0;
@@ -178,6 +251,9 @@ static void * ld_routine(void * args) {
 	proc->mm = (struct mm_struct*)malloc(sizeof(struct mm_struct));
 	init_mm(proc->mm, proc);
 #endif
+		/* dang ky PID->PCB de syscall tra duoc PCB that */
+		if (registry_register(&os, proc) != 0)
+			printf("registry_register failed for PID %d\n", proc->pid);
 		printf("\tLoaded a process at %s, PID: %d PRIO: %ld\n",
 			ld_processes.path[i], proc->pid, ld_processes.prio[i]);
 		add_proc(proc);
@@ -215,6 +291,11 @@ static void read_config(const char * path) {
 	for(sit = 1; sit < PAGING_MAX_MMSWP; sit++)
 		memswpsz[sit] = 0;
 #else
+#ifdef MM64_KERNEL_BASE_IN_CONFIG
+	/* format mo rong (spec 2.2.5): dong KERNEL_BASE truoc mem sizes.
+	 * Input mau khong co dong nay nen mac dinh dung KERNEL_BASE_ADDR (macOS). */
+	fscanf(file, "%lu\n", &kernel_base);
+#endif
 	/* Read input config of memory size: MEMRAM and upto 4 MEMSWP (mem swap)
 	 * Format: (size=0 result non-used memswap, must have RAM and at least 1 SWAP)
 	 *        MEM_RAM_SZ MEM_SWP0_SZ MEM_SWP1_SZ MEM_SWP2_SZ MEM_SWP3_SZ
@@ -257,6 +338,22 @@ int main(int argc, char * argv[]) {
 	strcat(path, "input/");
 	strcat(path, argv[1]);
 	read_config(path);
+
+	/* khoi tao registry + kernel cache pools truoc khi cac thread chay */
+	memset(os.pid_table, 0, sizeof(os.pid_table));
+#define NUM_KCACHE_POOL 5
+	os.kcpooltbl = (struct kcache_pool_struct*)
+		calloc(NUM_KCACHE_POOL, sizeof(struct kcache_pool_struct));
+	{
+		int kp_sizes[NUM_KCACHE_POOL] = {32, 64, 128, 256, 512};
+		int kp;
+		for (kp = 0; kp < NUM_KCACHE_POOL; kp++) {
+			os.kcpooltbl[kp].size = kp_sizes[kp];
+			os.kcpooltbl[kp].align = 8;
+			os.kcpooltbl[kp].slots_per_chunk = 8;
+			os.kcpooltbl[kp].free_list = NULL;
+		}
+	}
 
 	pthread_t * cpu = (pthread_t*)malloc(num_cpus * sizeof(pthread_t));
 	pthread_t * dma = (pthread_t*)malloc(sizeof(pthread_t));

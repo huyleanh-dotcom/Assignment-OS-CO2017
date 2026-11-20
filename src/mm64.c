@@ -423,19 +423,27 @@ int init_mm(struct mm_struct *mm, struct pcb_t *caller)
   vma0->vm_start = 0;
   vma0->vm_end = vma0->vm_start;
   vma0->sbrk = vma0->vm_start;
+  vma0->vm_freerg_list = NULL;
   struct vm_rg_struct *first_rg = init_vm_rg(vma0->vm_start, vma0->vm_end);
   enlist_vm_rg_node(&vma0->vm_freerg_list, first_rg);
 
   /* TODO update VMA0 next */
-  // vma0->next = ...
+  vma0->vm_next = NULL;   /* moi co 1 vma, chua co vma ke tiep */
 
   /* Point vma owner backward */
-  //vma0->vm_mm = mm; 
+  vma0->vm_mm = mm;
 
   /* TODO: update mmap */
-  //mm->mmap = ...
-  //mm->symrgtbl = ...
-  //mm->kcpooltbl
+  mm->mmap = vma0;
+  /* symrgtbl la mang co san trong struct, cho ve 0 het de active=0 */
+  for (int i = 0; i < PAGING_MAX_SYMTBL_SZ; i++)
+  {
+    mm->symrgtbl[i].vmaid    = 0;
+    mm->symrgtbl[i].rg_start = 0;
+    mm->symrgtbl[i].rg_end   = 0;
+    mm->symrgtbl[i].active   = 0;
+    mm->symrgtbl[i].rg_next  = NULL;
+  }
 
   return 0;
 }
@@ -444,8 +452,10 @@ struct vm_rg_struct *init_vm_rg(addr_t rg_start, addr_t rg_end)
 {
   struct vm_rg_struct *rgnode = malloc(sizeof(struct vm_rg_struct));
 
+  rgnode->vmaid = 0;
   rgnode->rg_start = rg_start;
   rgnode->rg_end = rg_end;
+  rgnode->active = 0;        /* node vung free, chua cap cho ai */
   rgnode->rg_next = NULL;
 
   return rgnode;
@@ -495,7 +505,10 @@ int print_list_rg(struct vm_rg_struct *irg)
   printf("\n");
   while (rg != NULL)
   {
-    printf("rg[" FORMAT_ADDR "->"  FORMAT_ADDR "]\n", rg->rg_start, rg->rg_end);
+    /* in them vmaid + active de debug reuse/active/free */
+    printf("rg[" FORMAT_ADDR "->"  FORMAT_ADDR "] vmaid=%d %s\n",
+           rg->rg_start, rg->rg_end, rg->vmaid,
+           rg->active ? "ACTIVE" : "free");
     rg = rg->rg_next;
   }
   printf("\n");
@@ -511,7 +524,10 @@ int print_list_vma(struct vm_area_struct *ivma)
   printf("\n");
   while (vma != NULL)
   {
-    printf("va[" FORMAT_ADDR "->" FORMAT_ADDR "]\n", vma->vm_start, vma->vm_end);
+    /* in them id + sbrk (ranh gioi vung dang dung) de debug */
+    printf("va[" FORMAT_ADDR "->" FORMAT_ADDR "] id=%lu sbrk=" FORMAT_ADDR "\n",
+           vma->vm_start, vma->vm_end,
+           (unsigned long)vma->vm_id, vma->sbrk);
     vma = vma->vm_next;
   }
   printf("\n");
