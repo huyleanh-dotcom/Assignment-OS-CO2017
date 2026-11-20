@@ -1,0 +1,6 @@
+os
+dma_testbench
+obj/
+*.o
+*.vcd
+src/syscalltbl.lst
