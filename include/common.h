@@ -14,6 +14,9 @@
 #include "os-mm.h"
 #endif
 
+/* so process toi da cho registry PID->PCB */
+#define MAX_PROC 1024
+
 #define ADDRESS_SIZE 20
 #define OFFSET_LEN 10
 #define FIRST_LV_LEN 5
@@ -136,7 +139,11 @@ struct krnl_t
 	struct memphy_struct *active_mswp;
 	uint32_t active_mswp_id;
 	struct kcache_pool_struct *kcpooltbl;
-	
+
+	/* registry PID->PCB: syscall nhan PID, tra PCB that o day
+	 * (khong tin con tro PCB tu user). Lock bao ve: os_mm_lock (os.c). */
+	struct pcb_t *pid_table[MAX_PROC];
+
 #ifdef MM64
 	addr_t *krnl_pgd;
 	addr_t *krnl_p4d;
@@ -148,6 +155,11 @@ struct krnl_t
 #endif
 #endif
 };
+
+/* API registry (dinh nghia trong os.c) - tat ca tu lock os_mm_lock ben trong */
+int  registry_register(struct krnl_t *krnl, struct pcb_t *proc);
+struct pcb_t *registry_lookup(struct krnl_t *krnl, uint32_t pid);
+int  registry_unregister(struct krnl_t *krnl, uint32_t pid);
 
 
 #endif
