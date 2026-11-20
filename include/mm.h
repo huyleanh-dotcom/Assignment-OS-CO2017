@@ -193,8 +193,9 @@ typedef enum pt_iter_action(*pt_global_mapping_callback)(
 
 /* Memory range operator */
 /* TODO implement the INCLUDE and OVERLAP checking mechanism */
-#define INCLUDE(x1,x2,y1,y2) (0)
-#define OVERLAP(x1,x2,y1,y2) (0)
+/* half-open interval checks on [x1,x2) and [y1,y2) */
+#define INCLUDE(x1,x2,y1,y2) (((x1) <= (y1)) && ((y2) <= (x2)))
+#define OVERLAP(x1,x2,y1,y2) (((x1) < (y2)) && ((y1) < (x2)))
 
 /* VM region prototypes */
 struct vm_rg_struct * init_vm_rg(addr_t rg_start, addr_t rg_end);

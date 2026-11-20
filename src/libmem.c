@@ -32,15 +32,21 @@ static pthread_mutex_t kmm_lock = PTHREAD_MUTEX_INITIALIZER;
  */
 int enlist_vm_freerg_list(struct mm_struct *mm, struct vm_rg_struct *rg_elmt)
 {
-  struct vm_rg_struct *rg_node = mm->mmap->vm_freerg_list;
-
+  if (mm == NULL || mm->mmap == NULL || rg_elmt == NULL)
+    return -1;
   if (rg_elmt->rg_start >= rg_elmt->rg_end)
     return -1;
 
-  if (rg_node != NULL)
-    rg_elmt->rg_next = rg_node;
+  /* coalesce: neu vung free lien ke vung co san thi gop lai */
+  struct vm_rg_struct *it = mm->mmap->vm_freerg_list;
+  while (it != NULL) {
+    if (it->rg_end == rg_elmt->rg_start) { it->rg_end = rg_elmt->rg_end; free(rg_elmt); return 0; }
+    if (rg_elmt->rg_end == it->rg_start) { it->rg_start = rg_elmt->rg_start; free(rg_elmt); return 0; }
+    it = it->rg_next;
+  }
 
   /* Enlist the new region */
+  rg_elmt->rg_next = mm->mmap->vm_freerg_list;
   mm->mmap->vm_freerg_list = rg_elmt;
 
   return 0;
@@ -53,10 +59,35 @@ int enlist_vm_freerg_list(struct mm_struct *mm, struct vm_rg_struct *rg_elmt)
  */
 struct vm_rg_struct *get_symrg_byid(struct mm_struct *mm, int rgid)
 {
-  if (rgid < 0 || rgid > PAGING_MAX_SYMTBL_SZ)
+  /* bien hop le la 0..MAX-1 nen phai '>=' (ban goc dung '>') */
+  if (mm == NULL || rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ)
     return NULL;
 
   return &mm->symrgtbl[rgid];
+}
+
+/* tra 0 neu symrgtbl[rgid] la vung active hop le; nguoc lai -1.
+ * P3 (READ/WRITE) phai goi truoc khi cham frame. */
+int vm_validate_active_region(struct pcb_t *caller, int rgid)
+{
+  if (caller == NULL) return -1;
+  struct vm_rg_struct *rg = get_symrg_byid(caller->mm, rgid);
+  if (rg == NULL || rg->active != 1) return -1;
+  if (rg->rg_start >= rg->rg_end) return -1;
+  return 0;
+}
+
+/* tra 1 neu co vung active nao de len page [page_vaddr, +PAGESZ). */
+int vm_page_has_active_region(struct mm_struct *mm, addr_t page_vaddr)
+{
+  if (mm == NULL) return 0;
+  addr_t pg_start = page_vaddr, pg_end = page_vaddr + PAGING64_PAGESZ;
+  for (int i = 0; i < PAGING_MAX_SYMTBL_SZ; i++) {
+    struct vm_rg_struct *rg = &mm->symrgtbl[i];
+    if (rg->active == 1 && rg->rg_start < pg_end && pg_start < rg->rg_end)
+      return 1;
+  }
+  return 0;
 }
 
 /*__alloc - allocate a region memory
@@ -71,15 +102,29 @@ int __alloc(struct pcb_t *caller, int vmaid, int rgid, addr_t size, addr_t *allo
 {
   /*Allocate at the toproof */
   pthread_mutex_lock(&mmvm_lock);
+
+  /* kiem tra tham so */
+  if (rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ || size == 0)
+  {
+    pthread_mutex_unlock(&mmvm_lock);
+    return -1;
+  }
+
   struct vm_rg_struct rgnode;
   struct vm_area_struct *cur_vma = get_vma_by_num(caller->mm, vmaid);
-  int inc_sz=0;
+  if (cur_vma == NULL)
+  {
+    pthread_mutex_unlock(&mmvm_lock);
+    return -1;
+  }
 
   if (get_free_vmrg_area(caller, vmaid, size, &rgnode) == 0)
   {
+    caller->mm->symrgtbl[rgid].vmaid    = vmaid;
     caller->mm->symrgtbl[rgid].rg_start = rgnode.rg_start;
     caller->mm->symrgtbl[rgid].rg_end = rgnode.rg_end;
- 
+    caller->mm->symrgtbl[rgid].active   = 1;
+
     *alloc_addr = rgnode.rg_start;
 
     pthread_mutex_unlock(&mmvm_lock);
@@ -87,34 +132,29 @@ int __alloc(struct pcb_t *caller, int vmaid, int rgid, addr_t size, addr_t *allo
   }
 
   /* TODO get_free_vmrg_area FAILED handle the region management (Fig.6)*/
-
-  /*Attempt to increate limit to get space */
-#ifdef MM64
-  inc_sz = (uint32_t)(size/(int)PAGING64_PAGESZ);
-  inc_sz = inc_sz + 1;
-#else
-  inc_sz = PAGING_PAGE_ALIGNSZ(size);
-#endif
-  int old_sbrk;
-  inc_sz = inc_sz + 1;
-
-  old_sbrk = cur_vma->sbrk;
+  /* khong co vung free vua -> xin them qua syscall; nho break cu */
+  addr_t old_sbrk = cur_vma->sbrk;
 
   /* TODO INCREASE THE LIMIT
    * SYSCALL 1 sys_memmap
    */
+  /* goi SYSCALL 17 sys_memmap voi op SYSMEM_INC_OP */
   struct sc_regs regs;
   regs.a1 = SYSMEM_INC_OP;
   regs.a2 = vmaid;
-#ifdef MM64
   regs.a3 = size;
-#else
-  regs.a3 = PAGING_PAGE_ALIGNSZ(size);
-#endif  
-  _syscall(caller->krnl, caller->pid, 17, &regs); /* SYSCALL 17 sys_memmap */
+
+  if (_syscall(caller->krnl, caller->pid, 17, &regs) != 0)
+  {
+    pthread_mutex_unlock(&mmvm_lock);
+    return -1;   /* rollback: syscall loi, khong ghi symrgtbl */
+  }
+
   /*Successful increase limit */
+  caller->mm->symrgtbl[rgid].vmaid    = vmaid;
   caller->mm->symrgtbl[rgid].rg_start = old_sbrk;
   caller->mm->symrgtbl[rgid].rg_end = old_sbrk + size;
+  caller->mm->symrgtbl[rgid].active   = 1;
 
   *alloc_addr = old_sbrk;
 
@@ -134,25 +174,34 @@ int __free(struct pcb_t *caller, int vmaid, int rgid)
 {
   pthread_mutex_lock(&mmvm_lock);
 
-  if (rgid < 0 || rgid > PAGING_MAX_SYMTBL_SZ)
+  if (rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ)   /* '>' -> '>=' */
   {
     pthread_mutex_unlock(&mmvm_lock);
     return -1;
   }
 
   /* TODO: Manage the collect freed region to freerg_list */
+  /* quy uoc: vung chua dung co rg_start==rg_end==0 */
   struct vm_rg_struct *rgnode = get_symrg_byid(caller->mm, rgid);
 
-  if (rgnode->rg_start == 0 && rgnode->rg_end == 0)
+  if (rgnode == NULL || rgnode->active != 1)   /* chi free vung dang active */
+  {
+    pthread_mutex_unlock(&mmvm_lock);
+    return -1;   /* khong co / da free -> tu choi (chong double free) */
+  }
+  struct vm_rg_struct *freerg_node = malloc(sizeof(struct vm_rg_struct));
+  if (freerg_node == NULL)
   {
     pthread_mutex_unlock(&mmvm_lock);
     return -1;
   }
-  struct vm_rg_struct *freerg_node = malloc(sizeof(struct vm_rg_struct));
+  freerg_node->vmaid = vmaid;
   freerg_node->rg_start = rgnode->rg_start;
   freerg_node->rg_end = rgnode->rg_end;
+  freerg_node->active = 0;
   freerg_node->rg_next = NULL;
 
+  rgnode->active = 0;                      /* danh dau slot free */
   rgnode->rg_start = rgnode->rg_end = 0;
   rgnode->rg_next = NULL;
 
@@ -172,10 +221,14 @@ int liballoc(struct pcb_t *proc, addr_t size, uint32_t reg_index)
 {
   addr_t  addr;
   int val = __alloc(proc, 0, reg_index, size, &addr);
-  if (val == -1)
+  if (val != 0)
   {
     return -1;
   }
+
+  /* luu dia chi da cap vao thanh ghi */
+  proc->regs[reg_index] = addr;
+
 #ifdef IODUMP
   /* TODO dump IO content (if needed) */
 #ifdef PAGETBL_DUMP
@@ -184,7 +237,7 @@ int liballoc(struct pcb_t *proc, addr_t size, uint32_t reg_index)
 #endif
 
   /* By default using vmaid = 0 */
-  return val;
+  return 0;
 }
 
 /*libfree - PAGING-based free a region memory
@@ -196,11 +249,11 @@ int liballoc(struct pcb_t *proc, addr_t size, uint32_t reg_index)
 int libfree(struct pcb_t *proc, uint32_t reg_index)
 {
   int val = __free(proc, 0, reg_index);
-  if (val == -1)
+  if (val != 0)
   {
     return -1;
   }
-printf("%s:%d\n",__func__,__LINE__);
+  /* bo dong printf debug cua ban goc */
 #ifdef IODUMP
   /* TODO dump IO content (if needed) */
 #ifdef PAGETBL_DUMP
@@ -418,19 +471,87 @@ int libwrite(
  *@size: memory size
  */
 
+/* kernel heap cap phat lien tuc, dung chung 1 con tro break cho ca kmalloc va pool.
+ * base lay tu kernel_base (os.c dat theo config), khoi tao lan dau khi can. */
+extern unsigned long kernel_base;
+static addr_t k_brk = 0;
+
+/* cap size byte tu kernel break, tra dia chi dau. phai dang giu kmm_lock khi goi */
+static addr_t kmem_bump(addr_t size)
+{
+  if (k_brk == 0) k_brk = (addr_t)kernel_base;
+  addr_t start = k_brk;
+  k_brk += PAGING64_PAGE_ALIGNSZ(size);
+  return start;
+}
+
+/* them 1 chunk slot co dinh vao free list cua pool; CALLER GIU kmm_lock */
+int kmem_pool_grow(struct kcache_pool_struct *pool)
+{
+  if (pool == NULL || pool->size <= 0) return -1;
+  int n = pool->slots_per_chunk > 0 ? pool->slots_per_chunk : 8;
+  addr_t chunk = kmem_bump((addr_t)pool->size * n);
+  for (int i = 0; i < n; i++) {
+    struct kmem_slot_node *node = malloc(sizeof(struct kmem_slot_node));
+    if (node == NULL) return -1;
+    node->kva = chunk + (addr_t)i * pool->size;
+    node->next = pool->free_list;
+    pool->free_list = node;
+  }
+  return 0;
+}
+
+/* lay 1 slot trong (grow neu het); tra kernel VA hoac -1 */
+addr_t kmem_pool_alloc_slot(struct kcache_pool_struct *pool)
+{
+  if (pool == NULL) return (addr_t)-1;
+  pthread_mutex_lock(&kmm_lock);
+  if (pool->free_list == NULL && kmem_pool_grow(pool) != 0) {
+    pthread_mutex_unlock(&kmm_lock);
+    return (addr_t)-1;
+  }
+  struct kmem_slot_node *node = pool->free_list;
+  pool->free_list = node->next;
+  addr_t kva = node->kva;
+  free(node);
+  pthread_mutex_unlock(&kmm_lock);
+  return kva;
+}
+
+/* tra 1 slot ve free list; chong double-free */
+int kmem_pool_free_slot(struct kcache_pool_struct *pool, addr_t kva)
+{
+  if (pool == NULL) return -1;
+  pthread_mutex_lock(&kmm_lock);
+  for (struct kmem_slot_node *it = pool->free_list; it != NULL; it = it->next)
+    if (it->kva == kva) { pthread_mutex_unlock(&kmm_lock); return -1; }
+  struct kmem_slot_node *node = malloc(sizeof(struct kmem_slot_node));
+  if (node == NULL) { pthread_mutex_unlock(&kmm_lock); return -1; }
+  node->kva = kva; node->next = pool->free_list; pool->free_list = node;
+  pthread_mutex_unlock(&kmm_lock);
+  return 0;
+}
+
 int libkmem_malloc(struct pcb_t * caller, uint32_t size, uint32_t reg_index)
 {
-  /* 
+  /*
    * TODO: provide OS level management
    *       and forward the request to helper
    */
-//addr_t  addr;
-//int val = ...
+  /* goi __kmalloc roi luu VA kernel vao thanh ghi */
+  addr_t addr;
+  if (__kmalloc(caller, 0, reg_index, size, &addr) != 0)
+    return -1;
+  caller->regs[reg_index] = addr;
 
-  /* 
+  /*
    * TODO: provide OS kmem allocation validation
    */
-
+#ifdef IODUMP
+#ifdef PAGETBL_DUMP
+  print_pgtbl(caller, 0, -1);
+#endif
+#endif
   return 0;
 }
 
@@ -446,13 +567,62 @@ addr_t __kmalloc(struct pcb_t *caller, int vmaid, int rgid, addr_t size, addr_t 
 {
   /* TODO: provide OS kernel memory allocation
    *       update krnl_pgd for OS kernel level management */
+  /* cap phat lien tuc tren kernel heap, lay dia chi tu kmem_bump (dung chung
+   * break voi slab pool nen khong bi cap de len nhau) */
+  if (caller == NULL || caller->krnl == NULL || caller->krnl->mm == NULL)
+    return (addr_t)-1;
+  if (rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ || size == 0)
+    return (addr_t)-1;
 
-  //struct krnl_t *krnl = caller->krnl;
-  //krnl->symrgtbl...
-  //krnl->krnl_pgd ...
+  pthread_mutex_lock(&kmm_lock);
 
+  addr_t start = kmem_bump(size);   /* break dung chung voi slab pool */
+
+  /* ghi vung vao bang symbol cua kernel mm */
+  struct mm_struct *kmm = caller->krnl->mm;
+  kmm->symrgtbl[rgid].vmaid    = vmaid;
+  kmm->symrgtbl[rgid].rg_start = start;
+  kmm->symrgtbl[rgid].rg_end   = start + size;
+  kmm->symrgtbl[rgid].active   = 1;   /* danh dau vung dang dung */
+
+  *alloc_addr = start;
+
+  pthread_mutex_unlock(&kmm_lock);
   return 0;
 
+}
+
+addr_t __kmem_cache_alloc(struct pcb_t *caller, int vmaid, int rgid, int cache_pool_id, addr_t *alloc_addr)
+{
+  /* lay 1 slot san co trong pool, het slot thi pool tu xin them tu kernel heap.
+   * do slot co kich thuoc co dinh nen it bi phan manh hon goi __kmalloc truc tiep */
+  if (caller == NULL || caller->krnl == NULL || caller->krnl->kcpooltbl == NULL)
+    return (addr_t)-1;
+  if (cache_pool_id < 0)
+    return (addr_t)-1;
+
+  struct kcache_pool_struct *pool = &caller->krnl->kcpooltbl[cache_pool_id];
+  if (pool->size <= 0)
+    return (addr_t)-1;
+
+  addr_t kva = kmem_pool_alloc_slot(pool);
+  if (kva == (addr_t)-1)
+    return (addr_t)-1;
+
+  /* ghi vung vao bang symbol cua kernel mm giong __kmalloc */
+  struct mm_struct *kmm = caller->krnl->mm;
+  if (rgid >= 0 && rgid < PAGING_MAX_SYMTBL_SZ && kmm != NULL) {
+    pthread_mutex_lock(&kmm_lock);
+    kmm->symrgtbl[rgid].vmaid    = vmaid;
+    kmm->symrgtbl[rgid].rg_start = kva;
+    kmm->symrgtbl[rgid].rg_end   = kva + pool->size;
+    kmm->symrgtbl[rgid].active   = 1;
+    pthread_mutex_unlock(&kmm_lock);
+  }
+
+  if (alloc_addr != NULL)
+    *alloc_addr = kva;
+  return 0;
 }
 
 
@@ -996,6 +1166,10 @@ int get_free_vmrg_area(struct pcb_t *caller, int vmaid, int size, struct vm_rg_s
 {
   struct vm_area_struct *cur_vma = get_vma_by_num(caller->mm, vmaid);
 
+  /* NULL-safe: chua co VMA thi khong co vung free */
+  if (cur_vma == NULL)
+    return -1;
+
   struct vm_rg_struct *rgit = cur_vma->vm_freerg_list;
 
   if (rgit == NULL)
@@ -1003,6 +1177,8 @@ int get_free_vmrg_area(struct pcb_t *caller, int vmaid, int size, struct vm_rg_s
 
   /* Probe unintialized newrg */
   newrg->rg_start = newrg->rg_end = -1;
+  newrg->vmaid = vmaid;
+  newrg->active = 1;
 
   /* Traverse on list of free vm region to find a fit space */
   while (rgit != NULL)

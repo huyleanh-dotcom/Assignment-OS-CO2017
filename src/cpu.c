@@ -59,7 +59,7 @@ int read(
 
 int write(
 	struct pcb_t *proc,	// Process executing the instruction
-	BYTE data,		// Data to be wrttien into memory
+	BYTE data,		// Data to be written into memory
 	uint32_t destination, // Index of destination register
 	uint32_t offset)
 { // Destination address =
@@ -113,7 +113,13 @@ switch (ins.opcode)
 		break;
 	case READ:
 #ifdef MM_PAGING
-		stat = libread(proc, ins.arg_0, ins.arg_1, (uint32_t*) &ins.arg_2);
+	{
+		/* read [source][offset][destination]: luu byte doc duoc
+		 * vao thanh ghi dich regs[arg_2], khong ghi vao operand */
+		uint32_t rd_val = 0;
+		stat = libread(proc, ins.arg_0, ins.arg_1, &rd_val);
+		proc->regs[ins.arg_2] = rd_val;
+	}
 #else
 		stat = read(proc, ins.arg_0, ins.arg_1, ins.arg_2);
 #endif

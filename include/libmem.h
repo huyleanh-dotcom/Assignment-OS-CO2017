@@ -25,3 +25,12 @@ int libkmem_malloc(struct pcb_t*, uint32_t, uint32_t);
 int libkmem_copy_from_user(struct pcb_t*, uint32_t, uint32_t, uint32_t, uint32_t);
 int libkmem_copy_to_user(struct pcb_t*, uint32_t, uint32_t, uint32_t, uint32_t);
 int libmem_dma_memcpy(struct pcb_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+
+/* helper kiem tra vung active (P3 goi truoc READ/WRITE) */
+int vm_validate_active_region(struct pcb_t *caller, int rgid);
+int vm_page_has_active_region(struct mm_struct *mm, addr_t page_vaddr);
+
+/* slab pool kernel heap */
+int    kmem_pool_grow(struct kcache_pool_struct *pool);
+addr_t kmem_pool_alloc_slot(struct kcache_pool_struct *pool);
+int    kmem_pool_free_slot(struct kcache_pool_struct *pool, addr_t kva);
