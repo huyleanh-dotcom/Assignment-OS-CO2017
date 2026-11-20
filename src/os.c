@@ -82,6 +82,10 @@ static void * cpu_routine(void * args) {
 			printf("\tCPU %d: Processed %2d has finished\n",
 				id ,proc->pid);
 			finish_proc(proc);
+#ifdef MM_PAGING
+			/* P1: trả frame RAM, SWAP slot và Page Table của process */
+			free_pcb_memph(proc);
+#endif
 			free(proc);
 			proc = get_proc();
 			time_left = 0;

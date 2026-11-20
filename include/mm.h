@@ -9,6 +9,16 @@
 extern "C" {
 #endif
 
+
+ /*
+ * thứ tự : P3 copy dữ liệu từ SWAP -> RAM
+ * rc = pt_translate_va(caller, va, PT_USER_READ, &t);    rc == PT_STATUS_SWAPPED
+ * MEMPHY_get_freefp(caller->krnl->mram, &fpn);            1. lấy frame
+ 2. copy SWAP[t.swptyp] slot t.swpoff  ->  RAM frame fpn
+ * pt_swapin_commit(caller, va, fpn);                     3. P1 commit PTE
+ * MEMPHY_put_freefp(caller->krnl->mswp[t.swptyp], t.swpoff);  4. trả slot SAU
+ */
+
 /* memory mapping states */
 enum pt_mapping_state {
     PT_MAP_EMPTY,
@@ -66,6 +76,30 @@ struct pt_translation {
     int swptyp;
     addr_t swpoff;
 };
+
+enum pt_iter_action {
+    PT_ITER_CONTINUE,
+    PT_ITER_STOP
+};
+
+enum pt_iter_result {
+    PT_ITER_DONE = 0,
+    PT_ITER_STOPPED = 1,
+    PT_ITER_ERROR = -1
+};
+
+typedef enum pt_iter_action(*pt_mapping_callback)(
+    addr_t va,
+    const struct pt_mapping_info* mapping,
+    void* ctx
+    );
+
+typedef enum pt_iter_action(*pt_global_mapping_callback)(
+    struct pcb_t* owner,
+    addr_t va,
+    const struct pt_mapping_info* mapping,
+    void* ctx
+    );
 
 /* CPU Bus definition */
 #define PAGING_CPU_BUS_WIDTH 22 /* 22bit bus - MAX SPACE 4MB */
@@ -216,6 +250,9 @@ int pt_unmap_one(struct pcb_t* caller, addr_t va, struct pt_mapping_info* old);
 int pt_update_access_flags(struct pcb_t* caller, addr_t va, int is_write);
 int pt_translate_user_for_copy(struct pcb_t* caller, addr_t va, int is_write, struct pt_translation* out);
 int vm_zero_allocated_range(struct pcb_t* caller, int is_kernel, addr_t start, addr_t end);
+int pt_iterate_mappings(struct pcb_t* caller, pt_mapping_callback callback, void* ctx);
+int pt_swapin_commit(struct pcb_t* caller, addr_t va, addr_t new_fpn);
+int free_pcb_memph(struct pcb_t* caller);
 
 /* VM prototypes */
 int pgalloc(struct pcb_t *proc, uint32_t size, uint32_t reg_index);

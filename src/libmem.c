@@ -862,36 +862,99 @@ int __write_user_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, B
   return 0;
 }
 
+struct pt_cleanup_ctx {
+    addr_t* va;
+    size_t  n, cap;
+    int     oom;
+};
+static enum pt_iter_action pt_cleanup_collect(addr_t va,
+                                              const struct pt_mapping_info *mi,
+                                              void *arg)
+{
+  struct pt_cleanup_ctx *c = arg;
+  (void)mi;
 
-/*free_pcb_memphy - collect all memphy of pcb
- *@caller: caller
- *@vmaid: ID vm area to alloc memory region
- *@incpgnum: number of page
+  if (c->n == c->cap) {
+    size_t ncap = c->cap ? c->cap * 2 : 64;
+    addr_t *nv = realloc(c->va, ncap * sizeof(*nv));
+    if (nv == NULL) {
+      c->oom = 1;
+      return PT_ITER_STOP;
+    }
+    c->va = nv;
+    c->cap = ncap;
+  }
+  c->va[c->n++] = va;
+  return PT_ITER_CONTINUE;
+}
+static struct memphy_struct* pt_swap_dev(struct krnl_t* krnl, int swptyp)
+{
+    if (krnl->mswp != NULL && swptyp >= 0 && swptyp < PAGING_MAX_MMSWP &&
+        krnl->mswp[swptyp] != NULL)
+        return krnl->mswp[swptyp];
+    return krnl->active_mswp;
+}
+/*
+ * free_pcb_memph - thu hồi TOÀN BỘ bộ nhớ User của một process
+ *@caller: process vừa kết thúc
+ *
+ *   1. pt_iterate_mappings gom VA của mọi mapping (callback chỉ đọc)
+ *   2. với từng VA: pt_unmap_one (xóa PTE + prune TRƯỚC) rồi mới trả
+ *        PRESENT -> frame về krnl->mram
+ *        SWAPPED -> slot về krnl->mswp[swptyp]
+ *        INVALID -> bỏ qua (không có gì hợp lệ để trả)
+ *      Mỗi mapping chỉ được unmap thành công một lần -> không Double Free.
+ *   3. dọn fifo_pgn còn sót, pt_destroy_tree (giải phóng cây kể cả root).
+ *   Kernel PGD dùng chung KHÔNG bị đụng.
+ *   Gọi lại lần 2 (mm->pgd đã NULL) -> trả 0, không làm gì.
+ * Trả 0 nếu thu hồi hết; -1 nếu cây hỏng / hết Host memory (phần đã gom
+ * được vẫn được thu hồi, cây vẫn bị hủy).
  */
 int free_pcb_memph(struct pcb_t *caller)
 {
-  pthread_mutex_lock(&mmvm_lock);
-  int pagenum, fpn;
-  uint32_t pte;
+    struct pt_cleanup_ctx c = { NULL, 0, 0, 0 };
+    int it, ret = 0;
+    size_t i;
 
-  for (pagenum = 0; pagenum < PAGING_MAX_PGN; pagenum++)
-  {
-    pte = caller->mm->pgd[pagenum];
+    if (caller == NULL || caller->krnl == NULL || caller->mm == NULL)
+        return -1;
 
-    if (PAGING_PAGE_PRESENT(pte))
-    {
-      fpn = PAGING_FPN(pte);
-      MEMPHY_put_freefp(caller->krnl->mram, fpn);
+    pthread_mutex_lock(&mmvm_lock);
+
+    if (caller->mm->pgd == NULL) {               
+        pthread_mutex_unlock(&mmvm_lock);
+        return 0;
     }
-    else
-    {
-      fpn = PAGING_SWP(pte);
-      MEMPHY_put_freefp(caller->krnl->active_mswp, fpn);
-    }
-  }
 
-  pthread_mutex_unlock(&mmvm_lock);
-  return 0;
+    /* 1 */
+    it = pt_iterate_mappings(caller, pt_cleanup_collect, &c);
+    if (it == PT_ITER_ERROR || c.oom)
+        ret = -1;
+
+    /* 2 */
+    for (i = 0; i < c.n; i++) {
+        struct pt_mapping_info old;
+
+        if (pt_unmap_one(caller, c.va[i], &old) != PT_STATUS_OK)
+            continue;                                /* INVALID / hỏng: không trả gì */
+        if (old.state == PT_MAP_PRESENT)
+            MEMPHY_put_freefp(caller->krnl->mram, old.location.fpn);
+        else if (old.state == PT_MAP_SWAPPED)
+            MEMPHY_put_freefp(pt_swap_dev(caller->krnl, old.location.swap.swptyp),
+                old.location.swap.swpoff);
+    }
+    free(c.va);
+
+    /* 3 */
+    while (caller->mm->fifo_pgn != NULL) {
+        struct pgn_t* nx = caller->mm->fifo_pgn->pg_next;
+        free(caller->mm->fifo_pgn);
+        caller->mm->fifo_pgn = nx;
+    }
+    pt_destroy_tree(caller->mm);
+
+    pthread_mutex_unlock(&mmvm_lock);
+    return ret;
 }
 
 

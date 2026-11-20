@@ -386,12 +386,17 @@ int pt_destroy_tree(struct mm_struct* mm)
     return PT_STATUS_OK;
 }
 
+static void pt_fifo_forget(struct mm_struct* mm, addr_t pgn);
+
 
 /*
  * pte_set_swap - Set PTE entry for swapped page
  * @pte    : target page table entry (PTE)
  * @swptyp : swap type
  * @swpoff : swap offset
+ *  *   P3 phải copy dữ liệu RAM -> SWAP TRƯỚC, và tự trả frame SAU khi hàm OK.
+ *   Trang được gỡ khỏi fifo_pgn (nếu còn) — fifo chỉ chứa trang PRESENT.
+ */
  */
 int pte_set_swap(struct pcb_t *caller, addr_t pgn, int swptyp, addr_t swpoff)
 {
@@ -432,7 +437,12 @@ int pte_set_swap(struct pcb_t *caller, addr_t pgn, int swptyp, addr_t swpoff)
 
   if (pte_encode_swapped(swptyp, swpoff, pte_decode_perm(old), &val) != 0)
       return PT_STATUS_ERROR;
-  return pte_set_entry(mm, pgn, val, caller);
+  if (pte_set_entry(mm, pgn, val, caller) != PT_STATUS_OK)
+      return PT_STATUS_ERROR;
+
+  /* bất biến: fifo_pgn chỉ chứa trang User đang PRESENT */
+  pt_fifo_forget(mm, pgn);
+  return PT_STATUS_OK;
 #else
   pte = &krnl->mm->pgd[pgn];
 #endif
@@ -1022,6 +1032,129 @@ int pt_update_access_flags(struct pcb_t* caller, addr_t va, int is_write)
     }
     return PT_STATUS_OK;
 }
+
+static addr_t pt_va_from_index(const unsigned idx[MM64_PT_LEVELS])
+{
+    uint64_t va = 0;
+    unsigned l;
+
+    for (l = 0; l < MM64_PT_LEVELS; l++)
+        va |= (uint64_t)idx[l] << MM64_LEVEL_SHIFT(l);
+    if (va & MM64_VA_SIGN_MASK)
+        va |= MM64_VA_CANON_MASK;
+    return (addr_t)va;
+}
+
+/* duyệt đệ quy một bảng; trả PT_ITER_DONE / STOPPED / ERROR */
+static int pt_iterate_level(const mm64_table_t* t, unsigned level,
+    unsigned idx[MM64_PT_LEVELS],
+    pt_mapping_callback cb, void* ctx)
+{
+    unsigned i;
+
+    for (i = 0; i < MM64_PT_ENTRIES; i++) {
+        uint64_t e = t->entries[i];
+
+        if (e == 0)
+            continue;                               
+        idx[level] = i;
+
+        if (level == MM64_LVL_PT) {
+            struct pt_mapping_info mi;
+            pte_decode_info((mm64_pte_t)e, &mi);
+            if (cb(pt_va_from_index(idx), &mi, ctx) == PT_ITER_STOP)
+                return PT_ITER_STOPPED;
+        }
+        else {
+            int rc;
+            if (pde_validate(e) != 0)
+                return PT_ITER_ERROR;                 
+            rc = pt_iterate_level(pde_child(e), level + 1, idx, cb, ctx);
+            if (rc != PT_ITER_DONE)
+                return rc;
+        }
+    }
+    return PT_ITER_DONE;
+}
+
+int pt_iterate_mappings(struct pcb_t* caller, pt_mapping_callback callback, void* ctx)
+{
+    unsigned idx[MM64_PT_LEVELS] = { 0 };
+
+    if (caller == NULL || caller->mm == NULL || caller->mm->pgd == NULL ||
+        callback == NULL)
+        return PT_ITER_ERROR;
+    return pt_iterate_level((const mm64_table_t*)caller->mm->pgd,
+        MM64_LVL_PGD, idx, callback, ctx);
+}
+
+/*
+ * pt_swapin_commit - commit PTE sau khi P3 đã copy SWAP -> RAM (việc 32)
+ * @caller  : process SỞ HỮU mapping; thao tác trên caller->mm
+ * @va      : VA bất kỳ trong trang (offset bị bỏ qua)
+ * @new_fpn : frame đã chứa dữ liệu; 0 .. MM64_PTE_FPN_MAX (FPN 0 hợp lệ)
+ *
+ *   Chỉ SWAPPED -> PRESENT. Giữ RW/USER/NX, ACCESSED = DIRTY = 0.
+ *   used_count không đổi. Trang được đưa lại vào fifo_pgn (mới nhất), bỏ
+ *   bản trùng nếu có -> P3 KHÔNG tự enlist_pgn_node nữa.
+ *   KHÔNG giải phóng SWAP slot, KHÔNG đụng frame: P3 trả SWAP slot SAU khi
+ *   hàm trả OK (dùng swptyp/swpoff đã đọc từ pt_translate_va trước đó).
+ *
+ * Trả OK | UNMAPPED (ô trống) | EXISTS (đã PRESENT) | DENIED (Kernel mm)
+ *    | INVALID_VA | ERROR (tham số, FPN tràn, ô INVALID, hết Host memory).
+ * Lỗi: không đổi gì. Bên gọi giữ Global MM Lock.
+ */ 
+ 
+int pt_swapin_commit(struct pcb_t* caller, addr_t va, addr_t new_fpn)
+{
+    struct mm_struct* mm;
+    struct pt_walk w;
+    struct pgn_t* node;
+    mm64_pte_t old, val;
+    addr_t pgn;
+    int rc;
+
+    if (caller == NULL || caller->mm == NULL || caller->mm->pgd == NULL)
+        return PT_STATUS_ERROR;
+    mm = caller->mm;
+    if (pt_is_kernel_mm(mm, caller))
+        return PT_STATUS_DENIED;                   /* Kernel không bao giờ bị swap */
+    if (!mm_is_canonical_va(va))
+        return PT_STATUS_INVALID_VA;
+
+    rc = pt_walk_internal((mm64_table_t*)mm->pgd, va, 0, &w);
+    if (rc != PT_STATUS_OK)
+        return rc;
+
+    old = *w.pte;
+    switch (pte_decode_state(old)) {
+    case PT_MAP_SWAPPED:
+        break;
+    case PT_MAP_EMPTY:
+        return PT_STATUS_UNMAPPED;
+    case PT_MAP_PRESENT:
+        return PT_STATUS_EXISTS;
+    default:
+        return PT_STATUS_ERROR;
+    }
+
+    if (pte_encode_present(new_fpn, pte_decode_perm(old), &val) != 0)
+        return PT_STATUS_ERROR;                    /* FPN tràn */
+    node = malloc(sizeof(*node));                /* cấp TRƯỚC khi commit */
+    if (node == NULL)
+        return PT_STATUS_ERROR;
+
+    /* commit */
+    *w.pte = val;
+    pgn = mm64_va_to_pgn((addr_t)MM64_VA_PAGE_BASE(va));
+    pt_fifo_forget(mm, pgn);
+    node->pgn = pgn;
+    node->pg_next = mm->fifo_pgn;
+    mm->fifo_pgn = node;
+    return PT_STATUS_OK;
+}
+
+
 
 
 __attribute__((weak)) int mm_reclaim_global_user(struct pcb_t* caller, int need)
