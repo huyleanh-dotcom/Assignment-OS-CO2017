@@ -4,4 +4,4 @@ obj/
 *.o
 *.vcd
 src/syscalltbl.lst
-tests.vs/
+tests
