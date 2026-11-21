@@ -30,8 +30,6 @@ void add_proc(struct pcb_t * proc);
 /* Remove a finished process from running_list; call before free(proc) */
 void finish_proc(struct pcb_t * proc);
 
-struct pcb_t* find_running_proc(uint32_t pid);
-
 #ifdef __cplusplus
 }
 #endif

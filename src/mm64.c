@@ -394,10 +394,10 @@ static void pt_fifo_forget(struct mm_struct* mm, addr_t pgn);
  * @pte    : target page table entry (PTE)
  * @swptyp : swap type
  * @swpoff : swap offset
- *  *   P3 phải copy dữ liệu RAM -> SWAP TRƯỚC, và tự trả frame SAU khi hàm OK.
+ *   P3 phải copy dữ liệu RAM -> SWAP TRƯỚC, và tự trả frame SAU khi hàm OK.
  *   Trang được gỡ khỏi fifo_pgn (nếu còn) — fifo chỉ chứa trang PRESENT.
  */
- */
+ 
 int pte_set_swap(struct pcb_t *caller, addr_t pgn, int swptyp, addr_t swpoff)
 {
   struct krnl_t *krnl = caller->krnl;

@@ -36,7 +36,7 @@ enum pt_status {
     PT_STATUS_INVALID_VA = -3,
     PT_STATUS_ERROR = -4,
     PT_STATUS_EXISTS = -5
-}
+};
 
 struct pt_mapping_info {
     enum pt_mapping_state state;
@@ -248,6 +248,7 @@ int __read(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE *data)
 int __write(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE value);
 int init_mm(struct mm_struct *mm, struct pcb_t *caller);
 int pt_unmap_one(struct pcb_t* caller, addr_t va, struct pt_mapping_info* old);
+int pt_translate_va(struct pcb_t* caller, addr_t va, enum pt_access_type access, struct pt_translation* out);
 int pt_update_access_flags(struct pcb_t* caller, addr_t va, int is_write);
 int pt_translate_user_for_copy(struct pcb_t* caller, addr_t va, int is_write, struct pt_translation* out);
 int vm_zero_allocated_range(struct pcb_t* caller, int is_kernel, addr_t start, addr_t end);

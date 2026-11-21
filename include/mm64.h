@@ -116,7 +116,7 @@ enum mm64_level {
 
 // * LEAF PTE 64 - bit
 
-define MM64_PTE_PRESENT(UINT64_C(1) << 0)
+#define MM64_PTE_PRESENT	 (UINT64_C(1) << 0)
 #define MM64_PTE_RW          (UINT64_C(1) << 1)
 #define MM64_PTE_USER        (UINT64_C(1) << 2)
 #define MM64_PTE_ACCESSED    (UINT64_C(1) << 5)
@@ -313,6 +313,30 @@ static inline uint64_t pte_decode_perm(mm64_pte_t pte)
 static inline uint64_t pte_decode_ad(mm64_pte_t pte)
 {
 	return pte & MM64_PTE_AD_MASK;
+}
+
+/* =====================================================================
+ * PHẦN G — VA / PGN  (việc 1.4)
+ *   Quy ước PGN MM64: 45 bit = VA bits 56..12  (0 .. MM64_PGN_MAX).
+ *   Trang nửa cao (bit 56 = 1) có PGN >= 2^44; đổi ngược sang VA phải
+ *   sign-extend để ra địa chỉ canonical.
+ * ===================================================================== */
+#define MM64_VA_CANON_MASK  (~((UINT64_C(1) << MM64_VA_BITS) - 1))   
+#define MM64_VA_SIGN_MASK   (UINT64_C(1) << MM64_VA_SIGN_BIT)          
+
+ /* VA (đã canonical) -> PGN 45-bit */
+static inline addr_t mm64_va_to_pgn(addr_t va)
+{
+	return (addr_t)((((uint64_t)va) >> MM64_PAGE_SHIFT) & MM64_PGN_MAX);
+}
+
+/* PGN 45-bit -> VA canonical của byte đầu trang. Người gọi kiểm tra pgn <= MM64_PGN_MAX. */
+static inline addr_t mm64_pgn_to_va(addr_t pgn)
+{
+	uint64_t va = (((uint64_t)pgn) & MM64_PGN_MAX) << MM64_PAGE_SHIFT;
+	if (va & MM64_VA_SIGN_MASK)
+		va |= MM64_VA_CANON_MASK;
+	return (addr_t)va;
 }
 
 

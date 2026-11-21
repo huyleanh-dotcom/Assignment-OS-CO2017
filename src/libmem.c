@@ -652,33 +652,6 @@ int libmem_dma_memcpy(struct pcb_t *caller, uint32_t src, uint32_t dst, uint32_t
 }
 
 
-int libkmem_copy_from_user(struct pcb_t *caller, uint32_t source, uint32_t destination, uint32_t offset, uint32_t size)
-{
-  /* TODO: provide OS level management kmem
-   */
-  /*
-   * TODO: Map kernel address range
-   */
-  //__read_user_mem(...)
-  //__write_kernel_mem(...);
-
-  return 0;
-}
-
-int libkmem_copy_to_user(struct pcb_t *caller, uint32_t source, uint32_t destination, uint32_t offset, uint32_t size)
-{
-  /* TODO: provide OS level management kmem
-   */
-  /*
-   * TODO: Map kernel address range
-   */
-  //__read_kernel_mem(...)
-  //__write_user_mem(...);
-
-  return 1;
-}
-
-
 
 __attribute__((weak)) int mm_region_is_active(struct mm_struct* mm, int vmaid, int rgid)
 {
