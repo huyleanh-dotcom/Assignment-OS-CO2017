@@ -89,7 +89,10 @@ void kernel_cleanup_process(struct pcb_t *proc)
 {
 	if (proc == NULL) return;
 	registry_unregister(&os, proc->pid);
-	/* P1 them pt_destroy_tree(proc->mm); P3 them free_pcb_memph(proc) tai day */
+#ifdef MM_PAGING
+/* trả frame RAM + SWAP slot, rồi pt_destroy_tree; cần proc->mm còn sống */
+	free_pcb_memph(proc);
+#endif
 	if (proc->mm != NULL) {
 		struct vm_area_struct *vma = proc->mm->mmap;
 		while (vma != NULL) {

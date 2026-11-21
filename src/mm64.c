@@ -133,6 +133,12 @@ unsigned long pt_host_tables_live(void)
     return n;
 }
 
+#ifdef MM64_TESTING
+/* Fault injection cho test rollback: lần cấp phát thứ N (đếm từ 1) thất bại */
+static long g_pt_fail_after = -1;
+void pt_test_fail_alloc_after(long n) { g_pt_fail_after = n; }
+#endif
+
 /*  * pt_table_alloc - Allocate a new page table for a given level
  * @level: the level of the page table (0 for PGD, 1 for P4D, etc.)
  * Return: pointer to the allocated page table, or NULL on failure
@@ -140,6 +146,11 @@ unsigned long pt_host_tables_live(void)
 static mm64_table_t* pt_table_alloc(unsigned level)
 {
     mm64_table_t* t;
+
+#ifdef MM64_TESTING
+    if (g_pt_fail_after >= 0 && g_pt_fail_after-- == 0)
+        return NULL;
+#endif
 
     if (posix_memalign((void**)&t, MM64_PAGE_SIZE, sizeof(mm64_table_t)) != 0)
         return NULL;
@@ -200,60 +211,82 @@ static int pt_count_dec(struct pt_walk* w, unsigned l)
     return 0;
 }
 
-/* pte_rollback_created_branches - recover branches */
-static int pt_rollback_created_branches(struct pt_walk* w)
+/* bảng có thật sự toàn 0 không (không tin used_count) */
+static int pt_table_is_empty(const mm64_table_t* t)
 {
-    int l;
+    unsigned i;
+    for (i = 0; i < MM64_PT_ENTRIES; i++)
+        if (t->entries[i] != 0)
+            return 0;
+    return 1;
+}
 
-    for (l = MM64_PT_LEVELS - 1; l >= 1; l--) {
-        mm64_pde_t* pe;
+/*
+ * pt_unlink_empty_table - gỡ bảng cấp l (1..4) trên nhánh của walk
+ *   Điều kiện (kiểm hết TRƯỚC khi sửa gì):
+ *     - used_count của bảng = 0  VÀ  bảng thật sự toàn 0
+ *     - nếu cha không phải root: used_count của cha > 0
+ *   Đạt -> free bảng, xóa entry ở cha, giảm count của cha, trả 0.
+ *   Không đạt -> không đổi gì, trả -1 (cây hỏng hoặc bảng còn dùng).
+ */
+static int pt_unlink_empty_table(struct pt_walk* w, unsigned l)
+{
+    mm64_pde_t* pe = &w->tbl[l - 1]->entries[w->idx[l - 1]];
 
-        if (!(w->created & (1u << l)) || w->tbl[l] == NULL)
-            continue;
+    if (pde_count(*pe) != 0 || !pt_table_is_empty(w->tbl[l]))
+        return -1;
+    if (l >= 2 && pde_count(w->tbl[l - 2]->entries[w->idx[l - 2]]) == 0)
+        return -1;
 
-        pe = &w->tbl[l - 1]->entries[w->idx[l - 1]];
-        if (pde_count(*pe) != 0)
-            return -1;
+    pt_table_free(w->tbl[l], l);
+    w->tbl[l] = NULL;
+    w->created &= ~(1u << l);
+    if (l == MM64_LVL_PT)
+        w->pte = NULL;
 
-        pt_table_free(w->tbl[l], (unsigned)l);
-        w->tbl[l] = NULL;
-        w->created &= ~(1u << l);
-        if (l == (int)MM64_LVL_PT)
-            w->pte = NULL;
-
-        *pe = 0;
-        pt_count_dec(w, (unsigned)(l - 1));
-    }
+    *pe = 0;
+    pt_count_dec(w, l - 1);          
     return 0;
 }
 
-/* pt_prune_empty - prune empty page tables after a PTE is cleared
- * @w: the pt_walk structure after a PTE has been cleared
+/*
+ * pt_prune_empty - Immediate Pruning
+ *   Đi từ cấp thấp nhất đang có lên trên, gỡ bảng rỗng; dừng ở bảng đầu
+ *   tiên còn entry. Không bao giờ gỡ root. Gặp count lệch với nội dung
+ *   thật thì dừng (giữ bảng) thay vì free một bảng còn mapping.
  */
 static void pt_prune_empty(struct pt_walk* w)
 {
     int l;
 
     for (l = MM64_PT_LEVELS - 1; l >= 1; l--) {
-        mm64_pde_t* pe;
-
         if (w->tbl[l] == NULL)
-            continue;                   
-
-        pe = &w->tbl[l - 1]->entries[w->idx[l - 1]];
-        if (pde_count(*pe) != 0)
-            break;                      
-
-        pt_table_free(w->tbl[l], (unsigned)l);
-        w->tbl[l] = NULL;
-        w->created &= ~(1u << l);
-        if (l == (int)MM64_LVL_PT)
-            w->pte = NULL;
-
-        *pe = 0;                      
-        pt_count_dec(w, (unsigned)(l - 1));
+            continue;                     
+        if (pt_unlink_empty_table(w, (unsigned)l) != 0)
+            break;
     }
 }
+
+/*
+ * pt_rollback_created_branches - hoàn tác nhánh mới tạo
+ *   Chỉ gỡ bảng có bit trong w->created và còn rỗng. Bảng đã có trước
+ *   walk không bao giờ bị đụng tới.
+ *   Trả 0 nếu hoàn tác hết; -1 nếu gặp bảng mới tạo nhưng đã có entry
+ *   (đã commit -> phải unmap, không phải rollback).
+ */
+static int pt_rollback_created_branches(struct pt_walk* w)
+{
+    int l;
+
+    for (l = MM64_PT_LEVELS - 1; l >= 1; l--) {
+        if (!(w->created & (1u << l)) || w->tbl[l] == NULL)
+            continue;
+        if (pt_unlink_empty_table(w, (unsigned)l) != 0)
+            return -1;
+    }
+    return 0;
+}
+
 
 /* pt_walk_internal - Walk the page table to find the PTE for a given virtual address
  * @root  : root page table (PGD)
@@ -386,6 +419,60 @@ int pt_destroy_tree(struct mm_struct* mm)
     return PT_STATUS_OK;
 }
 
+/* pte_verify_level - recursively verify a page table level
+ * @t    : the page table to verify
+ * @level : the level of the page table(0 for PGD, 1 for P4D, etc.)
+ * Return : number of invalid entries found
+ */
+static long pt_verify_level(const mm64_table_t* t, unsigned level)
+{
+    long bad = 0;
+    unsigned i;
+
+    if (((uintptr_t)t & MM64_PAGE_MASK) != 0)
+        bad++;                                         /* không căn 4096 */
+
+    for (i = 0; i < MM64_PT_ENTRIES; i++) {
+        uint64_t e = t->entries[i];
+        const mm64_table_t* c;
+        unsigned j, nz = 0;
+
+        if (e == 0)
+            continue;
+        if (level == MM64_LVL_PT) {
+            if (pte_decode_state(e) == PT_MAP_INVALID)
+                bad++;                                 /* leaf INVALID */
+            continue;
+        }
+        if (pde_validate(e) != 0) {
+            bad++;                                     /* entry trung gian hỏng */
+            continue;
+        }
+        c = pde_child(e);
+        for (j = 0; j < MM64_PT_ENTRIES; j++)
+            nz += (c->entries[j] != 0);
+        if (nz != pde_count(e))
+            bad++;                                     /* used_count lệch */
+        if (nz == 0)
+            bad++;                                     /* bảng rỗng chưa prune */
+        bad += pt_verify_level(c, level + 1);
+    }
+    return bad;
+}
+
+/*
+ * pt_verify_tree - đếm số vi phạm bất biến của cây (0 = sạch)
+ *   Kiểm: căn 4096, entry trung gian hợp lệ, used_count = số entry khác 0
+ *   thật, không còn bảng rỗng ngoài root, không có leaf INVALID.
+ *   Trả -1 nếu mm/root NULL. Chỉ đọc; bên gọi giữ Global MM Lock.
+ */
+long pt_verify_tree(struct mm_struct* mm)
+{
+    if (mm == NULL || mm->pgd == NULL)
+        return -1;
+    return pt_verify_level((const mm64_table_t*)mm->pgd, MM64_LVL_PGD);
+}
+
 static void pt_fifo_forget(struct mm_struct* mm, addr_t pgn);
 
 
@@ -399,19 +486,7 @@ static void pt_fifo_forget(struct mm_struct* mm, addr_t pgn);
  */
  
 int pte_set_swap(struct pcb_t *caller, addr_t pgn, int swptyp, addr_t swpoff)
-{
-  struct krnl_t *krnl = caller->krnl;
-
-  addr_t *pte;
-  addr_t pgd=0;
-  addr_t p4d=0;
-  addr_t pud=0;
-  addr_t pmd=0;
-  addr_t pt=0;
-	
-  // dummy pte alloc to avoid runtime error
-  pte = malloc(sizeof(addr_t));
-#ifdef MM64	
+{	
   struct mm_struct* mm;
   mm64_pte_t old, val;
 
@@ -443,17 +518,6 @@ int pte_set_swap(struct pcb_t *caller, addr_t pgn, int swptyp, addr_t swpoff)
   /* bất biến: fifo_pgn chỉ chứa trang User đang PRESENT */
   pt_fifo_forget(mm, pgn);
   return PT_STATUS_OK;
-#else
-  pte = &krnl->mm->pgd[pgn];
-#endif
-	
-  CLRBIT(*pte, PAGING_PTE_PRESENT_MASK);
-  SETBIT(*pte, PAGING_PTE_SWAPPED_MASK);
-
-  SETVAL(*pte, swptyp, PAGING_PTE_SWPTYP_MASK, PAGING_PTE_SWPTYP_LOBIT);
-  SETVAL(*pte, swpoff, PAGING_PTE_SWPOFF_MASK, PAGING_PTE_SWPOFF_LOBIT);
-
-  return 0;
 }
 
 /*
@@ -464,18 +528,6 @@ int pte_set_swap(struct pcb_t *caller, addr_t pgn, int swptyp, addr_t swpoff)
  */
 int pte_set_fpn(struct mm_struct *mm, addr_t pgn, addr_t fpn, struct pcb_t *caller)
 {
-  struct krnl_t *krnl = caller->krnl;
-
-  addr_t *pte = NULL;
-  addr_t pgd=0;
-  addr_t p4d=0;
-  addr_t pud=0;
-  addr_t pmd=0;
-  addr_t pt=0;
-	
-  // dummy pte alloc to avoid runtime error
-  pte = malloc(sizeof(addr_t));
-#ifdef MM64	
   mm64_pte_t old, val;
   uint64_t perm;
 
@@ -504,16 +556,6 @@ int pte_set_fpn(struct mm_struct *mm, addr_t pgn, addr_t fpn, struct pcb_t *call
   if (pte_encode_present(fpn, perm, &val) != 0)
       return PT_STATUS_ERROR;
   return pte_set_entry(mm, pgn, val, caller);
-#else
-  pte = &krnl->mm->pgd[pgn];
-#endif
-
-  SETBIT(*pte, PAGING_PTE_PRESENT_MASK);
-  CLRBIT(*pte, PAGING_PTE_SWAPPED_MASK);
-
-  SETVAL(*pte, fpn, PAGING_PTE_FPN_MASK, PAGING_PTE_FPN_LOBIT);
-
-  return 0;
 }
 
 
@@ -525,18 +567,7 @@ int pte_set_fpn(struct mm_struct *mm, addr_t pgn, addr_t fpn, struct pcb_t *call
  **/
 addr_t pte_get_entry(struct mm_struct *mm, addr_t pgn, struct pcb_t *caller)
 {
-  struct krnl_t *krnl = caller->krnl;
-
-  addr_t *pte = NULL;
-  addr_t pgd=0;
-  addr_t p4d=0;
-  addr_t pud=0;
-  addr_t pmd=0;
-  addr_t pt=0;
-	
-  // dummy pte alloc to avoid runtime error
-  pte = malloc(sizeof(addr_t));
-#ifdef MM64	
+  
   struct pt_walk w;
 
   mm = pt_resolve_mm(mm, caller);
@@ -548,9 +579,7 @@ addr_t pte_get_entry(struct mm_struct *mm, addr_t pgn, struct pcb_t *caller)
       return 0;
 
   return (addr_t)*w.pte;
-#endif
 
-  return (addr_t) &pte;
 }
 
 /* Set PTE page table entry
@@ -560,18 +589,7 @@ addr_t pte_get_entry(struct mm_struct *mm, addr_t pgn, struct pcb_t *caller)
  **/
 int pte_set_entry(struct mm_struct *mm, addr_t pgn, uint64_t pte_val, struct pcb_t *caller)
 {
-  struct krnl_t *krnl = caller->krnl;
-
-  addr_t *pte = NULL;
-  addr_t pgd=0;
-  addr_t p4d=0;
-  addr_t pud=0;
-  addr_t pmd=0;
-  addr_t pt=0;
-	
-  // dummy pte alloc to avoid runtime error
-  pte = malloc(sizeof(addr_t));
-#ifdef MM64	
+  
   struct pt_walk w;
   enum pt_mapping_state new_st, old_st;
   int rc;
@@ -625,11 +643,6 @@ int pte_set_entry(struct mm_struct *mm, addr_t pgn, uint64_t pte_val, struct pcb
   }
   *w.pte = (mm64_pte_t)pte_val;
   return PT_STATUS_OK;
-#else	
-  pte = pte_val;
-#endif
-
-	return 0;
 }
 
 /* pt_range_validate - check validate [va, va + pgnum * 4096) */
@@ -1419,14 +1432,11 @@ int __swap_cp_page(struct memphy_struct *mpsrc, addr_t srcfpn,
  */
 int init_mm(struct mm_struct *mm, struct pcb_t *caller)
 {
-  struct vm_area_struct *vma0 = malloc(sizeof(struct vm_area_struct));
+  /* P1: tạo PGD root rỗng (mm->pgd), trước khi cấp VMA để lỗi không rò vma0 */
+  if (pt_init_root(mm) != PT_STATUS_OK)
+      return -1;
 
-  /* TODO init page table directory */
-   //mm->pgd = ...
-   //mm->p4d = ...
-   //mm->pud = ...
-   //mm->pmd = ...
-   //mm->pt = ...
+  struct vm_area_struct* vma0 = malloc(sizeof(struct vm_area_struct));
 
 
   /* By default the owner comes with at least one vma */

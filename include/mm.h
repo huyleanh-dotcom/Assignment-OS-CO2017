@@ -229,6 +229,7 @@ int mm_is_canonical_va(addr_t va);
 int pt_init_root(struct mm_struct* mm);
 int pt_destroy_tree(struct mm_struct* mm);
 unsigned long pt_host_tables_live(void);
+long pt_verify_tree(struct mm_struct* mm);
 int get_pd_from_address(addr_t addr, addr_t* pgd, addr_t* p4d, addr_t* pud, addr_t* pmd, addr_t* pt);
 int get_pd_from_pagenum(addr_t pgn, addr_t* pgd, addr_t* p4d, addr_t* pud, addr_t* pmd, addr_t* pt);
 int pte_set_fpn(struct mm_struct *mm, addr_t pgn, addr_t fpn,struct pcb_t *caller);
