@@ -906,6 +906,17 @@ int pt_unmap_one(struct pcb_t* caller, addr_t va, struct pt_mapping_info* old)
         return PT_STATUS_ERROR;
     return pt_unmap_one_mm(caller->mm, va, old);
 }
+/*
+ * pt_unmap_kernel_one - unmap 1 trang trong Kernel PGD (caller->krnl->mm)
+ *   Cùng luật Strict Unmap với pt_unmap_one; @old nhận mapping cũ để bên
+ *   gọi trả frame SAU khi PTE đã xóa. Bên gọi giữ mmvm_lock.
+ */
+int pt_unmap_kernel_one(struct pcb_t* caller, addr_t va, struct pt_mapping_info* old)
+{
+    if (caller == NULL || caller->krnl == NULL)
+        return PT_STATUS_ERROR;
+    return pt_unmap_one_mm(caller->krnl->mm, va, old);
+}
 
 enum pt_op { PT_OP_READ, PT_OP_WRITE, PT_OP_EXEC };
 
@@ -1100,6 +1111,75 @@ int pt_iterate_mappings(struct pcb_t* caller, pt_mapping_callback callback, void
     return pt_iterate_level((const mm64_table_t*)caller->mm->pgd,
         MM64_LVL_PGD, idx, callback, ctx);
 }
+
+/* [M5.1] ---- duyệt mapping của MỌI process đã đăng ký (adapter P1) ---- */
+struct pt_global_iter_ctx {
+    struct krnl_t* krnl;
+    pt_global_mapping_callback cb;
+    void* ctx;
+    struct pcb_t* owner;               
+    int stopped;                       
+};
+
+static enum pt_iter_action pt_global_leaf(addr_t va,
+    const struct pt_mapping_info* mapping, void* arg)
+{
+    struct pt_global_iter_ctx* g = arg;
+    return g->cb(g->owner, va, mapping, g->ctx);
+}
+
+
+static int pt_global_visit(struct pcb_t* p, void* arg)
+{
+    struct pt_global_iter_ctx* g = arg;
+
+    if (p == NULL || p->krnl != g->krnl || p->mm == NULL || p->mm->pgd == NULL)
+        return 0;                                   
+    if (p->mm == g->krnl->mm)
+        return 0;                                   
+    g->owner = p;
+    if (pt_iterate_mappings(p, pt_global_leaf, g) == PT_ITER_STOPPED) {
+        g->stopped = 1;
+        return 1;                                  
+    }
+    return 0;
+}
+
+/*
+ * pt_iterate_registered_address_spaces - duyệt leaf PRESENT/SWAPPED của mọi
+ *   process trong registry (chỉ User address space, chỉ đọc)
+ * @krnl : kernel sở hữu registry
+ * @cb   : gọi cb(owner, va, mapping, ctx) cho từng leaf; trong 1 process VA
+ *         tăng dần, process theo thứ tự ô pid_table
+ * @ctx  : truyền nguyên cho cb
+ *
+ *   cb trả PT_ITER_STOP -> dừng TOÀN BỘ (không sang process kế).
+ *   Trả PT_ITER_DONE | PT_ITER_STOPPED | PT_ITER_ERROR (krnl/cb NULL).
+ *
+ *   Bên gọi giữ mmvm_lock: process thoát cần lock này mới free mm được,
+ *   nên PCB/mm không biến mất giữa chừng. Bên trong chỉ lấy os_mm_lock
+ *   (registry) -> thứ tự mmvm_lock -> os_mm_lock.
+ *   cb KHÔNG được unmap/alloc/free hay khóa mmvm_lock; muốn sửa thì gom
+ *   VA vào ctx và sửa sau khi hàm trả về.
+ */
+int pt_iterate_registered_address_spaces(struct krnl_t* krnl,
+    pt_global_mapping_callback cb, void* ctx)
+{
+    struct pt_global_iter_ctx g;
+
+    if (krnl == NULL || cb == NULL)
+        return PT_ITER_ERROR;
+    g.krnl = krnl;
+    g.cb = cb;
+    g.ctx = ctx;
+    g.owner = NULL;
+    g.stopped = 0;
+    if (registry_foreach_process(krnl, pt_global_visit, &g) < 0)
+        return PT_ITER_ERROR;
+    return g.stopped ? PT_ITER_STOPPED : PT_ITER_DONE;
+}
+
+
 
 /*
  * pt_swapin_commit - commit PTE sau khi P3 đã copy SWAP -> RAM (việc 32)
@@ -1349,8 +1429,6 @@ static addr_t pt_vm_map(struct pcb_t* caller, struct mm_struct* mm,
  */
 addr_t vm_map_ram(struct pcb_t *caller, addr_t astart, addr_t aend, addr_t mapstart, int incpgnum, struct vm_rg_struct *ret_rg)
 {
-  struct framephy_struct *frm_lst = NULL;
-  addr_t ret_alloc = 0;
 
   /*@bksysnet: author provides a feasible solution of getting frames
    *FATAL logic in here, wrong behaviour if we have not enough page
@@ -1366,6 +1444,45 @@ addr_t vm_map_ram(struct pcb_t *caller, addr_t astart, addr_t aend, addr_t mapst
 
   return 0;
 }
+
+
+/*
+ * vm_map_kernel_contig - M4: map npages trang Kernel liên tiếp từ @va tới
+ *   dải FPN liên tục [first_fpn, first_fpn + npages) vào Kernel PGD.
+ *   Quyền Kernel mặc định, KHÔNG vào FIFO (nonpageable). Nguyên tử (dùng
+ *   pt_map_range). Không cấp / trả frame: frame thuộc bên gọi.
+ *   Trả 0 | PT_STATUS_* âm. Bên gọi giữ mmvm_lock.
+ */
+int vm_map_kernel_contig(struct pcb_t* caller, addr_t va, addr_t first_fpn, addr_t npages)
+{
+    struct framephy_struct* head = NULL, ** tail = &head, * fp;
+    addr_t i;
+    int rc;
+
+    if (caller == NULL || caller->krnl == NULL || caller->krnl->mm == NULL || npages == 0)
+        return PT_STATUS_ERROR;
+
+    for (i = 0; i < npages; i++) {            /* danh sách tạm, chỉ để truyền FPN */
+        fp = calloc(1, sizeof(*fp));
+        if (fp == NULL) {
+            rc = PT_STATUS_ERROR;
+            goto out;
+        }
+        fp->fpn = first_fpn + i;
+        *tail = fp;
+        tail = &fp->fp_next;
+    }
+    rc = pt_map_range(caller->krnl->mm, va, (uint64_t)npages, head,
+        MM64_PTE_DEFAULT_KERNEL & MM64_PTE_PERM_MASK, 0);
+out:
+    while (head != NULL) {
+        fp = head->fp_next;
+        free(head);
+        head = fp;
+    }
+    return rc;
+}
+
 
 
 /*
@@ -1425,6 +1542,24 @@ int __swap_cp_page(struct memphy_struct *mpsrc, addr_t srcfpn,
   return 0;
 }
 
+
+static struct vm_area_struct* mm_new_vma(struct mm_struct* mm, unsigned long id,
+    enum vm_area_type type, addr_t start, addr_t end)
+{
+    struct vm_area_struct* v = malloc(sizeof(*v));
+    if (v == NULL)
+        return NULL;
+    v->vm_id = id;
+    v->vm_start = start;
+    v->vm_end = end;
+    v->sbrk = start;
+    v->vm_type = type;
+    v->vm_mm = mm;
+    v->vm_freerg_list = NULL;
+    v->vm_next = NULL;
+    return v;
+}
+
 /*
  *Initialize a empty Memory Management instance
  * @mm:     self mm
@@ -1432,41 +1567,50 @@ int __swap_cp_page(struct memphy_struct *mpsrc, addr_t srcfpn,
  */
 int init_mm(struct mm_struct *mm, struct pcb_t *caller)
 {
+    static const struct { unsigned long id; enum vm_area_type t; addr_t s, e; } L[] = {
+      { MM64_VMA_ID_HEAP0,    VMA_HEAP_SMALL, MM64_UVA_HEAP_START,
+                                              MM64_UVA_HEAP_START + MM64_VMA_SMALL_SZ },
+      { MM64_VMA_ID_PAGEZERO, VMA_PAGEZERO,   MM64_UVA_PAGEZERO_START, MM64_UVA_PAGEZERO_END },
+      { MM64_VMA_ID_TEXT,     VMA_TEXT,       MM64_UVA_TEXT_START,     MM64_UVA_TEXT_END },
+      { MM64_VMA_ID_DATA,     VMA_DATA,       MM64_UVA_DATA_START,     MM64_UVA_DATA_END },
+      { MM64_VMA_ID_SHARED,   VMA_SHARED,     MM64_UVA_SHARED_START,   MM64_UVA_SHARED_END },
+      { MM64_VMA_ID_STACK,    VMA_STACK,      MM64_UVA_STACK_START,    MM64_UVA_STACK_END },
+    };
+    struct vm_area_struct** tail;
+    size_t k;
+    int i;
+
+    (void)caller;
   /* P1: tạo PGD root rỗng (mm->pgd), trước khi cấp VMA để lỗi không rò vma0 */
-  if (pt_init_root(mm) != PT_STATUS_OK)
-      return -1;
+    if (pt_init_root(mm) != PT_STATUS_OK)
+        return -1;
 
-  struct vm_area_struct* vma0 = malloc(sizeof(struct vm_area_struct));
+    mm->mmap = NULL;
+    tail = &mm->mmap;
+    for (k = 0; k < sizeof(L) / sizeof(L[0]); k++) {
+        struct vm_area_struct* v = mm_new_vma(mm, L[k].id, L[k].t, L[k].s, L[k].e);
+        if (v == NULL) {
+            while (mm->mmap != NULL) {
+                struct vm_area_struct* n = mm->mmap->vm_next;
+                free(mm->mmap);
+                mm->mmap = n;
+            }
+            pt_destroy_tree(mm);
+            return -1;
+        }
+        *tail = v;
+        tail = &v->vm_next;
+    }
 
-
-  /* By default the owner comes with at least one vma */
-  vma0->vm_id = 0;
-  vma0->vm_start = 0;
-  vma0->vm_end = vma0->vm_start;
-  vma0->sbrk = vma0->vm_start;
-  vma0->vm_freerg_list = NULL;
-  struct vm_rg_struct *first_rg = init_vm_rg(vma0->vm_start, vma0->vm_end);
-  enlist_vm_rg_node(&vma0->vm_freerg_list, first_rg);
-
-  /* TODO update VMA0 next */
-  vma0->vm_next = NULL;   /* moi co 1 vma, chua co vma ke tiep */
-
-  /* Point vma owner backward */
-  vma0->vm_mm = mm;
-
-  /* TODO: update mmap */
-  mm->mmap = vma0;
-  /* symrgtbl la mang co san trong struct, cho ve 0 het de active=0 */
-  for (int i = 0; i < PAGING_MAX_SYMTBL_SZ; i++)
-  {
-    mm->symrgtbl[i].vmaid    = 0;
-    mm->symrgtbl[i].rg_start = 0;
-    mm->symrgtbl[i].rg_end   = 0;
-    mm->symrgtbl[i].active   = 0;
-    mm->symrgtbl[i].rg_next  = NULL;
-  }
-
-  return 0;
+    for (i = 0; i < PAGING_MAX_SYMTBL_SZ; i++)
+    {
+        mm->symrgtbl[i].vmaid = 0;
+        mm->symrgtbl[i].rg_start = 0;
+        mm->symrgtbl[i].rg_end = 0;
+        mm->symrgtbl[i].active = 0;
+        mm->symrgtbl[i].rg_next = NULL;
+    }
+    return 0;
 }
 
 struct vm_rg_struct *init_vm_rg(addr_t rg_start, addr_t rg_end)
@@ -1569,22 +1713,150 @@ int print_list_pgn(struct pgn_t *ip)
   return 0;
 }
 
-int print_pgtbl(struct pcb_t *caller, addr_t start, addr_t end)
+/* =====================================================================
+ * I1 — THỐNG KÊ & DUMP PAGE TABLE (chỉ đọc, bên gọi giữ Global MM Lock)
+ * ===================================================================== */
+
+ /* đếm bảng / leaf của một nhánh; trả số entry trung gian hỏng (0 = sạch) */
+static long pt_stats_level(const mm64_table_t* t, unsigned level,
+    struct pt_table_stats* s)
 {
-//addr_t pgn = ...
-//addr_t pgit = ...
-//struct mm_struct *mm = ...
-  addr_t pgd=0;
-  addr_t p4d=0;
-  addr_t pud=0;
-  addr_t pmd=0;
-  addr_t pt=0;
+    long bad = 0;
+    unsigned i;
 
-  get_pd_from_address(start, &pgd, &p4d, &pud, &pmd, &pt);
+    s->tables[level]++;
+    for (i = 0; i < MM64_PT_ENTRIES; i++) {
+        uint64_t e = t->entries[i];
 
-  /* TODO traverse the page map and dump the page directory entries */
+        if (e == 0)
+            continue;
+        if (level == MM64_LVL_PT) {
+            switch (pte_decode_state((mm64_pte_t)e)) {
+            case PT_MAP_PRESENT: s->present++; break;
+            case PT_MAP_SWAPPED: s->swapped++; break;
+            default:             s->invalid++; break;
+            }
+            if (e & MM64_PTE_USER) s->user_leaves++;
+            else                   s->kernel_leaves++;
+            continue;
+        }
+        if (pde_validate(e) != 0) {
+            bad++;                       /* không lần theo con trỏ hỏng */
+            continue;
+        }
+        bad += pt_stats_level(pde_child(e), level + 1, s);
+    }
+    return bad;
+}
 
-  return 0;
+/*
+ * pt_page_table_stats - thống kê Host Page Table
+ * @mm  : cây cần đếm; NULL -> số liệu toàn cục (mọi cây đang sống)
+ * @out : kết quả (luôn được xóa về 0 trước)
+ *
+ *   tables[l]   số bảng 4 KiB ở cấp l (0 = PGD ... 4 = PT), gồm cả root
+ *   host_bytes  tổng_bảng * 4096 = bộ nhớ Host mà Page Table chiếm
+ *   present / swapped / invalid, user_leaves / kernel_leaves:
+ *               chỉ có khi mm != NULL (đếm leaf của đúng cây đó)
+ *   walks / allocs / frees: bộ đếm toàn cục (walk là lần đọc metadata
+ *               Page Table, tách khỏi I/O của MEMPHY)
+ *
+ * Trả 0 | -1 (out NULL, mm không có root, hoặc gặp entry trung gian hỏng;
+ * khi hỏng, out vẫn chứa phần đếm được). Chỉ đọc.
+ */
+int pt_page_table_stats(struct mm_struct* mm, struct pt_table_stats* out)
+{
+    unsigned l;
+    long bad = 0;
+
+    if (out == NULL)
+        return -1;
+    memset(out, 0, sizeof(*out));
+
+    if (mm == NULL) {
+        for (l = 0; l < MM64_PT_LEVELS; l++)
+            out->tables[l] = g_pt_stats.live[l];
+    }
+    else {
+        if (mm->pgd == NULL)
+            return -1;
+        bad = pt_stats_level((const mm64_table_t*)mm->pgd, MM64_LVL_PGD, out);
+    }
+
+    for (l = 0; l < MM64_PT_LEVELS; l++)
+        out->total_tables += out->tables[l];
+    out->host_bytes = out->total_tables * MM64_PAGE_SIZE;
+    out->walks = g_pt_stats.walks;
+    out->allocs = g_pt_stats.allocs;
+    out->frees = g_pt_stats.frees;
+    return bad == 0 ? 0 : -1;
+}
+
+
+/* -------- print_pgtbl ------------------------------------------------ */
+struct pt_dump_ctx {
+    addr_t start, end;                   /* [start, end) — end = -1: tới hết */
+};
+
+static enum pt_iter_action pt_dump_one(addr_t va, const struct pt_mapping_info* mi,
+    void* ctx)
+{
+    const struct pt_dump_ctx* c = ctx;
+
+    if (va < c->start || va >= c->end)
+        return PT_ITER_CONTINUE;
+
+    printf("  [%c] va=%016llx ", mi->user ? 'U' : 'K', (unsigned long long)va);
+    if (mi->state == PT_MAP_PRESENT)
+        printf("PRESENT fpn=%llu", (unsigned long long)mi->location.fpn);
+    else if (mi->state == PT_MAP_SWAPPED)
+        printf("SWAPPED type=%d off=%llu", mi->location.swap.swptyp,
+            (unsigned long long)mi->location.swap.swpoff);
+    else
+        printf("INVALID");
+    printf(" %s%s%s%s\n", mi->rw ? "RW" : "RO", mi->nx ? " NX" : " X",
+        mi->accessed ? " A" : "", mi->dirty ? " D" : "");
+    return PT_ITER_CONTINUE;
+}
+
+/*
+ * print_pgtbl - dump Page Table User của caller trong [start, end)
+ *   Dòng 1 giữ định dạng gốc "PDG= P4g= PUD= PMD=": địa chỉ Host của các
+ *   bảng trên đường đi tới @start (0 nếu nhánh chưa có).
+ *   Tiếp theo: mỗi leaf một dòng ([U]/[K], PRESENT fpn | SWAPPED type/off,
+ *   quyền, A/D), rồi một dòng thống kê số bảng / byte Host / số leaf.
+ *   Chỉ đọc. Bên gọi giữ Global MM Lock (libmem: mmvm_lock).
+ */
+int print_pgtbl(struct pcb_t* caller, addr_t start, addr_t end)
+{
+    struct pt_dump_ctx ctx;
+    struct pt_table_stats st;
+    struct pt_walk w;
+    addr_t tbl[MM64_PT_LEVELS] = { 0 };
+    unsigned l;
+
+    if (caller == NULL || caller->mm == NULL || caller->mm->pgd == NULL)
+        return -1;
+
+    /* lookup thuần (create = 0): UNMAPPED vẫn cho biết các bảng đã có */
+    pt_walk_internal((mm64_table_t*)caller->mm->pgd, start, 0, &w);
+    for (l = 0; l < MM64_PT_LEVELS; l++)
+        tbl[l] = (addr_t)(uintptr_t)w.tbl[l];
+    printf(" PDG=%016llx P4g=%016llx PUD=%016llx PMD=%016llx\n",
+        (unsigned long long)tbl[MM64_LVL_PGD], (unsigned long long)tbl[MM64_LVL_P4D],
+        (unsigned long long)tbl[MM64_LVL_PUD], (unsigned long long)tbl[MM64_LVL_PMD]);
+
+    ctx.start = start;
+    ctx.end = end;
+    if (pt_iterate_mappings(caller, pt_dump_one, &ctx) == PT_ITER_ERROR)
+        printf("  !! page table hỏng (entry trung gian không hợp lệ)\n");
+
+    pt_page_table_stats(caller->mm, &st);
+    printf("  pid=%d tables PGD=%lu P4D=%lu PUD=%lu PMD=%lu PT=%lu"
+        " (%lu x 4096 = %lu B) present=%lu swapped=%lu\n",
+        caller->pid, st.tables[0], st.tables[1], st.tables[2], st.tables[3],
+        st.tables[4], st.total_tables, st.host_bytes, st.present, st.swapped);
+    return 0;
 }
 
 #endif  //def MM64

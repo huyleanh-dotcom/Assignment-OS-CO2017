@@ -29,7 +29,7 @@
 
 static int time_slot;
 static int num_cpus;
-static int done = 0;
+static volatile int done = 0;
 static struct krnl_t os;
 
 /* Global MM lock + registry PID->PCB.
@@ -84,6 +84,33 @@ int registry_unregister(struct krnl_t *krnl, uint32_t pid)
 	return -1;
 }
 
+/*
+ * registry_foreach_process - duyệt mọi process đang đăng ký
+ *   Chép con trỏ PCB ra mảng tạm dưới os_mm_lock, rồi gọi cb NGOÀI lock:
+ *   cb được phép lấy lock khác mà không giữ os_mm_lock lâu.
+ *   cb trả != 0 -> dừng. Trả số process đã gọi cb, -1 nếu tham số sai.
+ *
+ *   Con trỏ chỉ còn hợp lệ khi bên gọi giữ mmvm_lock: process thoát làm
+ *   registry_unregister TRƯỚC rồi mới free_pcb_memph (cần mmvm_lock) và
+ *   free(mm), nên không thể bị giải phóng giữa chừng.
+ *   Thứ tự lock toàn hệ thống: mmvm_lock -> os_mm_lock (không bao giờ ngược).
+ */
+int registry_foreach_process(struct krnl_t* krnl, int (*cb)(struct pcb_t*, void*), void* ctx)
+{
+	struct pcb_t* snap[MAX_PROC];
+	int i, n = 0;
+
+	if (krnl == NULL || cb == NULL) return -1;
+	pthread_mutex_lock(&os_mm_lock);
+	for (i = 0; i < MAX_PROC; i++)
+		if (krnl->pid_table[i] != NULL) snap[n++] = krnl->pid_table[i];
+	pthread_mutex_unlock(&os_mm_lock);
+
+	for (i = 0; i < n; i++)
+		if (cb(snap[i], ctx) != 0) return i + 1;
+	return n;
+}
+
 /* don dep tap trung khi process exit: go registry roi giai phong user mm */
 void kernel_cleanup_process(struct pcb_t *proc)
 {
@@ -91,6 +118,7 @@ void kernel_cleanup_process(struct pcb_t *proc)
 	registry_unregister(&os, proc->pid);
 #ifdef MM_PAGING
 /* trả frame RAM + SWAP slot, rồi pt_destroy_tree; cần proc->mm còn sống */
+	kmem_release_process(proc);
 	free_pcb_memph(proc);
 #endif
 	if (proc->mm != NULL) {
@@ -148,10 +176,10 @@ static void * cpu_routine(void * args) {
 			/* No process is running, the we load new process from
 		 	* ready queue */
 			proc = get_proc();
-			if (proc == NULL) {
-                           next_slot(timer_id);
-                           continue; /* First load failed. skip dummy load */
-                        }
+			//if (proc == NULL) {
+   //                        next_slot(timer_id);
+   //                        continue; /* First load failed. skip dummy load */
+   //                     }
 		}else if (proc->pc == proc->code->size) {
 			/* The porcess has finish it job */
 			printf("\tCPU %d: Processed %2d has finished\n",
@@ -349,19 +377,21 @@ int main(int argc, char * argv[]) {
 
 	/* khoi tao registry + kernel cache pools truoc khi cac thread chay */
 	memset(os.pid_table, 0, sizeof(os.pid_table));
-#define NUM_KCACHE_POOL 5
+
 	os.kcpooltbl = (struct kcache_pool_struct*)
-		calloc(NUM_KCACHE_POOL, sizeof(struct kcache_pool_struct));
+		calloc(KMEM_NUM_POOLS, sizeof(struct kcache_pool_struct));
 	{
-		int kp_sizes[NUM_KCACHE_POOL] = {32, 64, 128, 256, 512};
+		int kp_sizes[KMEM_NUM_POOLS] = { 16, 32, 64, 96, 128, 192, 256, 512, 1024, 2048 };
 		int kp;
-		for (kp = 0; kp < NUM_KCACHE_POOL; kp++) {
+		for (kp = 0; kp < KMEM_NUM_POOLS; kp++) {
 			os.kcpooltbl[kp].size = kp_sizes[kp];
-			os.kcpooltbl[kp].align = 8;
-			os.kcpooltbl[kp].slots_per_chunk = 8;
-			os.kcpooltbl[kp].free_list = NULL;
+			os.kcpooltbl[kp].align = 16;
+			os.kcpooltbl[kp].slots_per_chunk = KMEM_CHUNK_SIZE / kp_sizes[kp];
+			os.kcpooltbl[kp].chunks = NULL;
+			os.kcpooltbl[kp].nchunks = 0;
 		}
 	}
+
 
 	pthread_t * cpu = (pthread_t*)malloc(num_cpus * sizeof(pthread_t));
 	pthread_t * dma = (pthread_t*)malloc(sizeof(pthread_t));

@@ -390,4 +390,42 @@ static inline addr_t pt_translation_phys(const struct pt_translation* t)
 {
 	return (addr_t)(((uint64_t)t->fpn << MM64_PAGE_SHIFT) | (uint64_t)t->offset);
 }
+
+
+/* =====================================================================
+ * M2 — MM64 User layout và Heap class
+ * ===================================================================== */
+#define MM64_UVA_PAGEZERO_START   0x0000000000000000UL
+#define MM64_UVA_PAGEZERO_END     0x0000000000001000UL
+#define MM64_UVA_TEXT_START       0x0000000000001000UL
+#define MM64_UVA_TEXT_END         0x0000000000010000UL
+#define MM64_UVA_DATA_START       0x0000000000010000UL
+#define MM64_UVA_DATA_END         0x0000000000100000UL
+#define MM64_UVA_HEAP_START       0x0000000000100000UL   
+#define MM64_UVA_HEAP_END         0x0000000040000000UL
+#define MM64_UVA_SHARED_START     0x0000000040000000UL
+#define MM64_UVA_SHARED_END       0x0000000060000000UL
+#define MM64_UVA_STACK_START      0x000000007FF00000UL
+#define MM64_UVA_STACK_END        0x0000000080000000UL
+
+#define MM64_HEAP_SMALL_MAX       4096UL                  
+#define MM64_HEAP_MEDIUM_MAX      32768UL                 
+#define MM64_VMA_SMALL_SZ         (64UL  * 1024)
+#define MM64_VMA_MEDIUM_SZ        (256UL * 1024)
+#define MM64_VMA_LARGE_MIN_SZ     (1024UL * 1024)
+#define MM64_HEAP_ALIGN_SMALL     16UL
+#define MM64_HEAP_ALIGN_MEDIUM    16UL                    
+
+ /* vm_id cố định; VMA heap tạo thêm có id > MM64_VMA_ID_RESERVED_MAX */
+#define MM64_VMA_ID_HEAP0         0                       /* VMA0 = HEAP_SMALL (legacy) */
+#define MM64_VMA_ID_PAGEZERO      1
+#define MM64_VMA_ID_TEXT          2
+#define MM64_VMA_ID_DATA          3
+#define MM64_VMA_ID_SHARED        4
+#define MM64_VMA_ID_STACK         5
+#define MM64_VMA_ID_RESERVED_MAX  5
+
+#define MM64_ALIGN_UP(x, a)       ((((addr_t)(x)) + ((addr_t)(a) - 1)) & ~((addr_t)(a) - 1))
+#define VMA_IS_HEAP(t)            ((t) == VMA_HEAP_SMALL || (t) == VMA_HEAP_MEDIUM || (t) == VMA_HEAP_LARGE)
+
 #endif

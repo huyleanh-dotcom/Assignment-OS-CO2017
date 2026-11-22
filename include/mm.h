@@ -230,6 +230,17 @@ int pt_init_root(struct mm_struct* mm);
 int pt_destroy_tree(struct mm_struct* mm);
 unsigned long pt_host_tables_live(void);
 long pt_verify_tree(struct mm_struct* mm);
+
+/* thống kê Host Page Table (pt_page_table_stats) */
+struct pt_table_stats {
+    unsigned long tables[5];        /* theo cấp: 0 = PGD ... 4 = PT       */
+    unsigned long total_tables;
+    unsigned long host_bytes;       /* total_tables * 4096                */
+    unsigned long present, swapped, invalid;      /* leaf (khi mm != NULL) */
+    unsigned long user_leaves, kernel_leaves;
+    unsigned long walks, allocs, frees;           /* bộ đếm toàn cục      */
+};
+int pt_page_table_stats(struct mm_struct* mm, struct pt_table_stats* out);
 int get_pd_from_address(addr_t addr, addr_t* pgd, addr_t* p4d, addr_t* pud, addr_t* pmd, addr_t* pt);
 int get_pd_from_pagenum(addr_t pgn, addr_t* pgd, addr_t* p4d, addr_t* pud, addr_t* pmd, addr_t* pt);
 int pte_set_fpn(struct mm_struct *mm, addr_t pgn, addr_t fpn,struct pcb_t *caller);
@@ -248,14 +259,20 @@ int __free(struct pcb_t *caller, int vmaid, int rgid);
 int __read(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE *data);
 int __write(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE value);
 int init_mm(struct mm_struct *mm, struct pcb_t *caller);
+int pt_unmap_kernel_one(struct pcb_t* caller, addr_t va, struct pt_mapping_info* old);
 int pt_unmap_one(struct pcb_t* caller, addr_t va, struct pt_mapping_info* old);
 int pt_translate_va(struct pcb_t* caller, addr_t va, enum pt_access_type access, struct pt_translation* out);
 int pt_update_access_flags(struct pcb_t* caller, addr_t va, int is_write);
 int pt_translate_user_for_copy(struct pcb_t* caller, addr_t va, int is_write, struct pt_translation* out);
 int vm_zero_allocated_range(struct pcb_t* caller, int is_kernel, addr_t start, addr_t end);
 int pt_iterate_mappings(struct pcb_t* caller, pt_mapping_callback callback, void* ctx);
+int pt_iterate_registered_address_spaces(struct krnl_t* krnl, pt_global_mapping_callback cb, void* ctx);  
+int mm_iterate_user_mappings(struct krnl_t* krnl, pt_global_mapping_callback cb, void* ctx);              
 int pt_swapin_commit(struct pcb_t* caller, addr_t va, addr_t new_fpn);
 int free_pcb_memph(struct pcb_t* caller);
+int vm_map_kernel_contig(struct pcb_t* caller, addr_t va, addr_t first_fpn, addr_t npages);
+int kmem_release_process(struct pcb_t* proc);
+
 
 /* VM prototypes */
 int pgalloc(struct pcb_t *proc, uint32_t size, uint32_t reg_index);
@@ -274,6 +291,15 @@ int pgwrite(
 struct vm_rg_struct * get_symrg_byid(struct mm_struct* mm, int rgid);
 int validate_overlap_vm_area(struct pcb_t *caller, int vmaid, addr_t vmastart, addr_t vmaend);
 int get_free_vmrg_area(struct pcb_t *caller, int vmaid, int size, struct vm_rg_struct *newrg);
+
+enum vm_area_type vm_class_of_size(addr_t size);
+
+addr_t vm_class_align(enum vm_area_type type);
+addr_t vm_class_vma_size(enum vm_area_type type, addr_t size);
+int    vm_area_create(struct mm_struct* mm, enum vm_area_type type, addr_t start, addr_t len, unsigned long* out_id);
+int    vm_area_discard(struct mm_struct* mm, unsigned long vm_id);
+int    vm_find_heap_gap(struct mm_struct* mm, addr_t len, addr_t* out_start);
+
 int inc_vma_limit(struct pcb_t *caller, int vmaid, addr_t inc_sz);
 int find_victim_page(struct mm_struct* mm, addr_t *pgn);
 struct vm_area_struct *get_vma_by_num(struct mm_struct *mm, int vmaid);
@@ -282,6 +308,10 @@ struct vm_area_struct *get_vma_by_num(struct mm_struct *mm, int vmaid);
 int MEMPHY_format(struct memphy_struct *mp, int pagesz);
 int MEMPHY_get_freefp(struct memphy_struct *mp, addr_t *fpn);
 int MEMPHY_put_freefp(struct memphy_struct *mp, addr_t fpn);
+int MEMPHY_get_contig_fp(struct memphy_struct* mp, addr_t nframes, addr_t* first_fpn);
+int MEMPHY_put_contig_fp(struct memphy_struct* mp, addr_t first_fpn, addr_t nframes);
+int MEMPHY_frame_is_free(struct memphy_struct* mp, addr_t fpn);
+long MEMPHY_verify(struct memphy_struct* mp);
 int MEMPHY_mv_csr(struct memphy_struct *mp, addr_t offset);
 int MEMPHY_seq_read(struct memphy_struct *mp, addr_t addr, BYTE *value);
 int MEMPHY_read(struct memphy_struct * mp, addr_t addr, BYTE *value);
