@@ -41,18 +41,32 @@ pthread_mutex_t os_mm_lock = PTHREAD_MUTEX_INITIALIZER;
 #define KERNEL_BASE_ADDR 0xFFFFFF8000000000UL
 unsigned long kernel_base = KERNEL_BASE_ADDR;
 
+/* expose global MM lock de P3 khoa/mo ma khong dong truc tiep vao mutex
+ * (tranh tu khoa lai non-recursive mutex). */
+int mm_global_lock(void)   { return pthread_mutex_lock(&os_mm_lock); }
+int mm_global_unlock(void) { return pthread_mutex_unlock(&os_mm_lock); }
+
+/* Bang bam dia chi mo (open addressing), linear probe.
+ * Dung tombstone cho o da xoa: lookup KHONG duoc dung tai o vua xoa (NULL that)
+ * giua chuoi probe, neu khong se bo sot entry bi dich do va cham. */
+#define REG_TOMBSTONE ((struct pcb_t *)-1)
+
 int registry_register(struct krnl_t *krnl, struct pcb_t *proc)
 {
 	if (krnl == NULL || proc == NULL) return -1;
 	pthread_mutex_lock(&os_mm_lock);
-	int i, slot = proc->pid % MAX_PROC;
+	int i, slot = proc->pid % MAX_PROC, first_free = -1;
 	for (i = 0; i < MAX_PROC; i++) {
 		int idx = (slot + i) % MAX_PROC;
-		if (krnl->pid_table[idx] == NULL) { krnl->pid_table[idx] = proc; pthread_mutex_unlock(&os_mm_lock); return 0; }
-		if (krnl->pid_table[idx]->pid == proc->pid) { pthread_mutex_unlock(&os_mm_lock); return -1; }
+		struct pcb_t *e = krnl->pid_table[idx];
+		if (e == NULL) { if (first_free < 0) first_free = idx; break; }
+		if (e == REG_TOMBSTONE) { if (first_free < 0) first_free = idx; continue; }
+		if (e->pid == proc->pid) { pthread_mutex_unlock(&os_mm_lock); return -1; }
 	}
+	if (first_free < 0) { pthread_mutex_unlock(&os_mm_lock); return -1; }  /* bang day */
+	krnl->pid_table[first_free] = proc;
 	pthread_mutex_unlock(&os_mm_lock);
-	return -1;
+	return 0;
 }
 
 struct pcb_t *registry_lookup(struct krnl_t *krnl, uint32_t pid)
@@ -63,8 +77,10 @@ struct pcb_t *registry_lookup(struct krnl_t *krnl, uint32_t pid)
 	struct pcb_t *found = NULL;
 	for (i = 0; i < MAX_PROC; i++) {
 		int idx = (slot + i) % MAX_PROC;
-		if (krnl->pid_table[idx] == NULL) break;
-		if (krnl->pid_table[idx]->pid == pid) { found = krnl->pid_table[idx]; break; }
+		struct pcb_t *e = krnl->pid_table[idx];
+		if (e == NULL) break;                 /* het chuoi probe -> khong co */
+		if (e == REG_TOMBSTONE) continue;     /* o da xoa -> di tiep, dung dung */
+		if (e->pid == pid) { found = e; break; }
 	}
 	pthread_mutex_unlock(&os_mm_lock);
 	return found;
@@ -77,11 +93,51 @@ int registry_unregister(struct krnl_t *krnl, uint32_t pid)
 	int i, slot = pid % MAX_PROC;
 	for (i = 0; i < MAX_PROC; i++) {
 		int idx = (slot + i) % MAX_PROC;
-		if (krnl->pid_table[idx] == NULL) break;
-		if (krnl->pid_table[idx]->pid == pid) { krnl->pid_table[idx] = NULL; pthread_mutex_unlock(&os_mm_lock); return 0; }
+		struct pcb_t *e = krnl->pid_table[idx];
+		if (e == NULL) break;
+		if (e == REG_TOMBSTONE) continue;
+		if (e->pid == pid) { krnl->pid_table[idx] = REG_TOMBSTONE; pthread_mutex_unlock(&os_mm_lock); return 0; }
 	}
 	pthread_mutex_unlock(&os_mm_lock);
 	return -1;
+}
+
+/* duyet moi PCB con song, goi callback NGAY TRONG LUC giu lock (an toan cho
+ * reclaim: PCB khong the bi go giua chung). callback tra khac 0 de dung som.
+ * LUU Y: callback dang chay duoi os_mm_lock -> KHONG duoc goi lai cac ham
+ * registry_* / mm_global_lock (se tu khoa). */
+int registry_for_each_locked(struct krnl_t *krnl,
+                             int (*callback)(struct pcb_t *, void *), void *arg)
+{
+	if (krnl == NULL || callback == NULL) return -1;
+	pthread_mutex_lock(&os_mm_lock);
+	int i, rc = 0;
+	for (i = 0; i < MAX_PROC; i++) {
+		struct pcb_t *e = krnl->pid_table[i];
+		if (e == NULL || e == REG_TOMBSTONE) continue;
+		rc = callback(e, arg);
+		if (rc != 0) break;
+	}
+	pthread_mutex_unlock(&os_mm_lock);
+	return rc;
+}
+
+/* duyet lan luot cac PCB con song trong registry (cho global reclaim cua P3).
+ * *cursor khoi tao = 0; moi lan tra 1 PCB va day cursor; het thi tra NULL.
+ *   int cur = 0; struct pcb_t *p;
+ *   while ((p = registry_iter(krnl, &cur)) != NULL) { ... } */
+struct pcb_t *registry_iter(struct krnl_t *krnl, int *cursor)
+{
+	if (krnl == NULL || cursor == NULL) return NULL;
+	pthread_mutex_lock(&os_mm_lock);
+	struct pcb_t *found = NULL;
+	while (*cursor < MAX_PROC) {
+		int idx = (*cursor)++;
+		struct pcb_t *e = krnl->pid_table[idx];
+		if (e != NULL && e != REG_TOMBSTONE) { found = e; break; }
+	}
+	pthread_mutex_unlock(&os_mm_lock);
+	return found;
 }
 
 /* don dep tap trung khi process exit: go registry roi giai phong user mm */

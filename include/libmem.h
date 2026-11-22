@@ -26,9 +26,12 @@ int libkmem_copy_from_user(struct pcb_t*, uint32_t, uint32_t, uint32_t, uint32_t
 int libkmem_copy_to_user(struct pcb_t*, uint32_t, uint32_t, uint32_t, uint32_t);
 int libmem_dma_memcpy(struct pcb_t*, uint32_t, uint32_t, uint32_t, uint32_t);
 
-/* helper kiem tra vung active (P3 goi truoc READ/WRITE) */
-int vm_validate_active_region(struct pcb_t *caller, int rgid);
+/* helper kiem tra vung active, READ/WRITE goi truoc khi truy cap */
+int vm_validate_active_region(struct pcb_t *caller, int rgid, addr_t offset);
 int vm_page_has_active_region(struct mm_struct *mm, addr_t page_vaddr);
+/* validate day du 1 truy cap [offset,offset+size), tra VA da xac thuc (cho P3) */
+int vm_validate_active_access(struct pcb_t *caller, int vmaid, int rgid,
+                              addr_t offset, addr_t size, addr_t *out_vaddr);
 
 /* slab pool kernel heap */
 int    kmem_pool_grow(struct kcache_pool_struct *pool);

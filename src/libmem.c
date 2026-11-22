@@ -66,14 +66,38 @@ struct vm_rg_struct *get_symrg_byid(struct mm_struct *mm, int rgid)
   return &mm->symrgtbl[rgid];
 }
 
-/* tra 0 neu symrgtbl[rgid] la vung active hop le; nguoc lai -1.
- * P3 (READ/WRITE) phai goi truoc khi cham frame. */
-int vm_validate_active_region(struct pcb_t *caller, int rgid)
+/* tra 0 neu truy cap vung rgid tai offset la hop le, nguoc lai -1.
+ * kiem: rgid hop le, vung dang active, offset khong vuot kich thuoc vung.
+ * READ/WRITE goi truoc khi cham frame de tranh dung nham vung da free. */
+int vm_validate_active_region(struct pcb_t *caller, int rgid, addr_t offset)
 {
-  if (caller == NULL) return -1;
+  if (caller == NULL || caller->mm == NULL) return -1;
   struct vm_rg_struct *rg = get_symrg_byid(caller->mm, rgid);
   if (rg == NULL || rg->active != 1) return -1;
   if (rg->rg_start >= rg->rg_end) return -1;
+  if (offset >= rg->rg_end - rg->rg_start) return -1;   /* offset vuot vung */
+  return 0;
+}
+
+/* Validate day du mot lan truy cap [offset, offset+size) trong vung rgid.
+ * Kiem: vung active, vmaid khop, offset+size nam gon trong vung (khong tran so),
+ * dia chi van thuoc user space (duoi kernel_base). Tra *out_vaddr = VA da xac thuc.
+ * P3 goi truoc READ/WRITE/copy de chan truy cap sai. */
+extern unsigned long kernel_base;   /* dinh nghia trong os.c, khai bao o common.h */
+int vm_validate_active_access(struct pcb_t *caller, int vmaid, int rgid,
+                              addr_t offset, addr_t size, addr_t *out_vaddr)
+{
+  if (caller == NULL || caller->mm == NULL) return -1;
+  struct vm_rg_struct *rg = get_symrg_byid(caller->mm, rgid);
+  if (rg == NULL || rg->active != 1) return -1;
+  if (rg->rg_start >= rg->rg_end) return -1;
+  if (rg->vmaid != vmaid) return -1;                 /* sai vung dia chi */
+  if (size == 0) return -1;
+  addr_t rg_sz = rg->rg_end - rg->rg_start;
+  if (offset >= rg_sz) return -1;                    /* offset ngoai vung */
+  if (size > rg_sz - offset) return -1;              /* offset+size vuot (khong tran so) */
+  if (rg->rg_end > (addr_t)kernel_base) return -1;   /* vung lan sang kernel space */
+  if (out_vaddr != NULL) *out_vaddr = rg->rg_start + offset;
   return 0;
 }
 
@@ -472,8 +496,8 @@ int libwrite(
  */
 
 /* kernel heap cap phat lien tuc, dung chung 1 con tro break cho ca kmalloc va pool.
- * base lay tu kernel_base (os.c dat theo config), khoi tao lan dau khi can. */
-extern unsigned long kernel_base;
+ * base lay tu kernel_base (os.c dat theo config), khoi tao lan dau khi can.
+ * kernel_base khai bao trong common.h. */
 static addr_t k_brk = 0;
 
 /* cap size byte tu kernel break, tra dia chi dau. phai dang giu kmm_lock khi goi */
