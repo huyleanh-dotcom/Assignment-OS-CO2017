@@ -8,7 +8,6 @@
  *
  * DPI RTL C++ interface to  DMA RTL
  */
-
 #include <verilated.h>
 #include <verilated_vcd_c.h>
 #include "Vdma_top.h"
