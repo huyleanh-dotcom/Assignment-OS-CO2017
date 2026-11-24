@@ -44,10 +44,11 @@ struct vm_area_struct *get_vma_by_num(struct mm_struct *mm, int vmaid)
   return NULL;
 }
 
-int __mm_swap_page(struct pcb_t *caller, addr_t vicfpn , addr_t swpfpn)
+int __mm_swap_page(struct pcb_t* caller, addr_t vicfpn, addr_t swpfpn)
 {
-    __swap_cp_page(caller->krnl->mram, vicfpn, caller->krnl->active_mswp, swpfpn);
-    return 0;
+    if (caller == NULL || caller->krnl == NULL)
+        return -1;
+    return __swap_cp_page(caller->krnl->mram, vicfpn, caller->krnl->active_mswp, swpfpn);
 }
 
 /*get_vm_area_node - get vm area for a number of pages
@@ -91,41 +92,27 @@ struct vm_rg_struct *get_vm_area_node_at_brk(struct pcb_t *caller, int vmaid, ad
  *@vmastart: vma end
  *@vmaend: vma end
  *
+ * 
+ * validate_overlap_vm_area - kiểm khoảng DỰ ĐỊNH [vmastart, vmaend)
+ *   0 khi start < end và không chồng VMA nào khác @vmaid (-1 = VMA mới,
+ *   so với tất cả); với VMA mới còn phải nằm trong HEAP window. -1 nếu sai.
+ *   Chỉ đọc; bên gọi giữ mmvm_lock.
  */
 int validate_overlap_vm_area(struct pcb_t *caller, int vmaid, addr_t vmastart, addr_t vmaend)
 {
-  struct vm_area_struct *vma = caller->mm->mmap;
+    struct vm_area_struct* vma;
 
-  /* TODO validate the planned memory area is not overlapped */
-  if (vmastart >= vmaend)
-  {
-    return -1;
-  }
-
-  if (vma == NULL)
-  {
-    return -1;
-  }
-
-  /* TODO validate the planned memory area is not overlapped */
-
-  struct vm_area_struct *cur_area = get_vma_by_num(caller->mm, vmaid);
-  if (cur_area == NULL)
-  {
-    return -1;
-  }
-
-  while (vma != NULL)
-  {
-    if (vma != cur_area && OVERLAP(cur_area->vm_start, cur_area->vm_end, vma->vm_start, vma->vm_end))
-    {
-      return -1;
+    if (caller == NULL || caller->mm == NULL || vmastart >= vmaend)
+        return -1;
+    if (vmaid < 0 && (vmastart < MM64_UVA_HEAP_START || vmaend > MM64_UVA_HEAP_END))
+        return -1;
+    for (vma = caller->mm->mmap; vma != NULL; vma = vma->vm_next) {
+        if (vmaid >= 0 && vma->vm_id == (unsigned long)vmaid)
+            continue;
+        if (OVERLAP(vmastart, vmaend, vma->vm_start, vma->vm_end))
+            return -1;
     }
-    vma = vma->vm_next;
-  }
-  /* End TODO*/
-
-  return 0;
+    return 0;
 }
 
 /*inc_vma_limit - increase vm area limits to reserve space for new variable
@@ -133,54 +120,179 @@ int validate_overlap_vm_area(struct pcb_t *caller, int vmaid, addr_t vmastart, a
  *@vmaid: ID vm area to alloc memory region
  *@inc_sz: increment size
  *
+ *   inc_vma_limit - SYSMEM_INC_OP: tăng sbrk của VMA heap @vmaid thêm @inc_sz BYTE
+ *   new_sbrk = sbrk + inc_sz phải <= vm_end (vm_end cố định, không nới).
+ *   Chỉ map các trang MỚI [align_up_page(sbrk), align_up_page(new_sbrk));
+ *   vùng mới nằm gọn trong trang đã map thì không map gì.
+ *   sbrk chỉ đổi khi map thành công (pt_vm_map nguyên tử). 0 | -1.
+ *   Bên gọi giữ mmvm_lock (__alloc giữ; syscall không tự khóa).
  */
 int inc_vma_limit(struct pcb_t *caller, int vmaid, addr_t inc_sz)
 {
-  /* TOTO with new address scheme, the size need tobe aligned
-   *      the raw inc_sz maybe not fit pagesize
-   */
-  /* lam tron inc_sz len boi so cua page */
-  addr_t inc_amt    = PAGING64_PAGE_ALIGNSZ(inc_sz);
-  int    incnumpage = inc_amt / PAGING64_PAGESZ;
+    struct vm_area_struct* cur_vma;
+    addr_t old_sbrk, new_sbrk, map_start, map_end;
 
-  /* TODO: Obtain the new vm area based on vmaid */
-  /* lay vung moi tai break */
-  struct vm_rg_struct *area = get_vm_area_node_at_brk(caller, vmaid, inc_amt);
-  if (area == NULL)
-    return -1;
+    if (caller == NULL || caller->mm == NULL || inc_sz == 0)
+        return -1;
+    cur_vma = get_vma_by_num(caller->mm, vmaid);
+    if (cur_vma == NULL || !VMA_IS_HEAP(cur_vma->vm_type))
+        return -1;
 
-  struct vm_area_struct *cur_vma = get_vma_by_num(caller->mm, vmaid);
-  if (cur_vma == NULL) { free(area); return -1; }
+    old_sbrk = cur_vma->sbrk;
+    if (inc_sz > cur_vma->vm_end - old_sbrk)
+        return -1;                                  
+    new_sbrk = old_sbrk + inc_sz;
 
-  /*
-   * TODO Validate overlap of obtained region
-   *if (validate_overlap_vm_area(caller, vmaid, area->rg_start, area->rg_end) < 0)
-   *   return -1;  //Overlap and failed allocation
-   */
+    if (validate_overlap_vm_area(caller, vmaid, old_sbrk, new_sbrk) < 0)
+        return -1;
 
-  if (validate_overlap_vm_area(caller, vmaid, area->rg_start, area->rg_end) < 0)
-  {
-    free(area);
-    return -1;  /* overlap -> failed allocation */
-  }
+    map_start = MM64_ALIGN_UP(old_sbrk, PAGING64_PAGESZ);
+    map_end = MM64_ALIGN_UP(new_sbrk, PAGING64_PAGESZ);
+    if (map_end > map_start &&
+        (long)vm_map_ram(caller, cur_vma->vm_start, cur_vma->vm_end, map_start,
+            (int)((map_end - map_start) / PAGING64_PAGESZ), NULL) < 0)
+        return -1;
 
-  /* goi P1 map frame; vm_map_ram tra addr_t, sentinel am khi loi */
-  addr_t old_end = cur_vma->vm_end;
-  struct vm_rg_struct *mapped = malloc(sizeof(struct vm_rg_struct));
-  if (mapped == NULL) { free(area); return -1; }
+    cur_vma->sbrk = new_sbrk;
+    return 0;
+}
 
-  if ((long)vm_map_ram(caller, area->rg_start, area->rg_end,
-                       old_end, incnumpage, mapped) < 0)
-  {
-    free(area); free(mapped);
-    return -1;
-  }
+/* =====================================================================
+ *   HEAP CLASS, VMA NGANG CẤP, FIRST-FIT CẤP 2
+ * ===================================================================== */
 
-  cur_vma->vm_end = old_end + inc_amt;
-  cur_vma->sbrk   = area->rg_end;
+enum vm_area_type vm_class_of_size(addr_t size)
+{
+    if (size <= MM64_HEAP_SMALL_MAX)
+        return VMA_HEAP_SMALL;
+    if (size <= MM64_HEAP_MEDIUM_MAX)
+        return VMA_HEAP_MEDIUM;
+    return VMA_HEAP_LARGE;
+}
 
-  free(area); free(mapped);
-  return 0;
+addr_t vm_class_align(enum vm_area_type type)
+{
+    switch (type) {
+    case VMA_HEAP_SMALL:  return MM64_HEAP_ALIGN_SMALL;
+    case VMA_HEAP_MEDIUM: return MM64_HEAP_ALIGN_MEDIUM;
+    case VMA_HEAP_LARGE:  return PAGING64_PAGESZ;
+    default:              return 0;                     
+    }
+}
+
+/* dung lượng VA của VMA mới cho class; 0 nếu không phải heap / tràn số */
+addr_t vm_class_vma_size(enum vm_area_type type, addr_t size)
+{
+    addr_t len;
+
+    switch (type) {
+    case VMA_HEAP_SMALL:  return MM64_VMA_SMALL_SZ;
+    case VMA_HEAP_MEDIUM: return MM64_VMA_MEDIUM_SZ;
+    case VMA_HEAP_LARGE:
+        if (size > (addr_t)-1 - (PAGING64_PAGESZ - 1))
+            return 0;
+        len = MM64_ALIGN_UP(size, PAGING64_PAGESZ);
+        return len > MM64_VMA_LARGE_MIN_SZ ? len : MM64_VMA_LARGE_MIN_SZ;
+    default:
+        return 0;
+    }
+}
+
+/*
+ * vm_find_heap_gap - First-Fit cấp 2: khoảng VA thấp nhất trong HEAP window
+ *   chưa thuộc VMA nào, đủ @len (đã căn trang). Không phụ thuộc thứ tự mmap.
+ *   Trả 0 | -1 (hết chỗ / tràn số). Chỉ đọc; bên gọi giữ mmvm_lock.
+ */
+int vm_find_heap_gap(struct mm_struct* mm, addr_t len, addr_t* out_start)
+{
+    addr_t cand = MM64_UVA_HEAP_START;
+    struct vm_area_struct* v;
+    int moved;
+
+    if (mm == NULL || out_start == NULL || len == 0 || (len & (PAGING64_PAGESZ - 1)))
+        return -1;
+    do {
+        if (cand > MM64_UVA_HEAP_END || len > MM64_UVA_HEAP_END - cand)
+            return -1;
+        moved = 0;
+        for (v = mm->mmap; v != NULL; v = v->vm_next) {
+            if (OVERLAP(cand, cand + len, v->vm_start, v->vm_end)) {
+                cand = MM64_ALIGN_UP(v->vm_end, PAGING64_PAGESZ);
+                moved = 1;
+                break;
+            }
+        }
+    } while (moved);
+
+    *out_start = cand;
+    return 0;
+}
+
+/*
+ * vm_area_create - tạo VMA heap ngang cấp [start, start+len), sbrk = start,
+ *   chưa map trang nào; vm_id = max + 1; nối cuối mmap (VMA0 vẫn đứng đầu).
+ *   Bên gọi đã kiểm vùng trống; giữ mmvm_lock. Trả 0 | -1 (không đổi gì).
+ */
+int vm_area_create(struct mm_struct* mm, enum vm_area_type type,
+    addr_t start, addr_t len, unsigned long* out_id)
+{
+    struct vm_area_struct* v, ** pp, * nv;
+    unsigned long id = 0;
+
+    if (mm == NULL || out_id == NULL || !VMA_IS_HEAP(type) || len == 0 ||
+        start < MM64_UVA_HEAP_START || start > MM64_UVA_HEAP_END ||
+        len > MM64_UVA_HEAP_END - start)
+        return -1;
+    for (v = mm->mmap; v != NULL; v = v->vm_next) {
+        if (OVERLAP(start, start + len, v->vm_start, v->vm_end))
+            return -1;
+        if (v->vm_id >= id)
+            id = v->vm_id + 1;
+    }
+
+    nv = malloc(sizeof(*nv));
+    if (nv == NULL)
+        return -1;
+    nv->vm_id = id;
+    nv->vm_start = start;
+    nv->vm_end = start + len;
+    nv->sbrk = start;
+    nv->vm_type = type;
+    nv->vm_mm = mm;
+    nv->vm_freerg_list = NULL;
+    nv->vm_next = NULL;
+
+    for (pp = &mm->mmap; *pp != NULL; pp = &(*pp)->vm_next)
+        ;
+    *pp = nv;
+    *out_id = id;
+    return 0;
+}
+
+/*
+ * vm_area_discard - rollback VMA vừa tạo trong cùng giao dịch __alloc:
+ *   chỉ khi chưa có PTE (sbrk == vm_start), không region nào trỏ tới,
+ *   không phải VMA cố định (id 0..5). Bên gọi giữ mmvm_lock. 0 | -1.
+ */
+int vm_area_discard(struct mm_struct* mm, unsigned long vm_id)
+{
+    struct vm_area_struct** pp, * v;
+    int i;
+
+    if (mm == NULL || vm_id <= MM64_VMA_ID_RESERVED_MAX)
+        return -1;
+    for (pp = &mm->mmap; *pp != NULL && (*pp)->vm_id != vm_id; pp = &(*pp)->vm_next)
+        ;
+    v = *pp;
+    if (v == NULL || v->sbrk != v->vm_start || v->vm_freerg_list != NULL)
+        return -1;
+    for (i = 0; i < PAGING_MAX_SYMTBL_SZ; i++)
+        if (mm->symrgtbl[i].active == 1 && mm->symrgtbl[i].vmaid == (int)vm_id)
+            return -1;
+
+    *pp = v->vm_next;
+    free(v);
+    return 0;
 }
 
 // #endif

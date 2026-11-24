@@ -139,6 +139,9 @@ struct krnl_t
 	struct memphy_struct *active_mswp;
 	uint32_t active_mswp_id;
 	struct kcache_pool_struct *kcpooltbl;
+	addr_t kva_brk;             // 0 is not initialized, the first address of kernel heap       
+	struct kva_range* kva_free;       
+	struct kmem_region* kregions;     
 
 	/* registry PID->PCB: syscall nhan PID, tra PCB that o day
 	 * (khong tin con tro PCB tu user). Lock bao ve: os_mm_lock (os.c). */
@@ -160,6 +163,7 @@ struct krnl_t
 int  registry_register(struct krnl_t *krnl, struct pcb_t *proc);
 struct pcb_t *registry_lookup(struct krnl_t *krnl, uint32_t pid);
 int  registry_unregister(struct krnl_t *krnl, uint32_t pid);
+int  registry_foreach_process(struct krnl_t* krnl, int (*cb)(struct pcb_t*, void*), void* ctx);
 
 
 #endif

@@ -65,6 +65,15 @@ struct vm_rg_struct {
    struct vm_rg_struct *rg_next;
 };
 
+/* class của VMA (các VMA ngang cấp trong mm->mmap) */
+enum vm_area_type {
+    VMA_PAGEZERO = 0, VMA_TEXT, VMA_DATA,
+    VMA_HEAP_SMALL, VMA_HEAP_MEDIUM, VMA_HEAP_LARGE,
+    VMA_SHARED, VMA_STACK
+};
+
+
+
 /*
  *  Memory area struct
  */
@@ -74,6 +83,7 @@ struct vm_area_struct {
    addr_t vm_end;
 
    addr_t sbrk;
+   enum vm_area_type vm_type;         
 /*
  * Derived field
  * unsigned long vm_limit = vm_end - vm_start
@@ -83,17 +93,21 @@ struct vm_area_struct {
    struct vm_area_struct *vm_next;
 };
 
+#define KMEM_NUM_POOLS     10
+#define KMEM_CHUNK_SIZE    4096
+#define KMEM_MIN_SLOT      16
+#define KMEM_MAX_SLOT      2048                        
+#define KMEM_CHUNK_SLOTS   (KMEM_CHUNK_SIZE / KMEM_MIN_SLOT)  
 
-/* node theo doi mot slot kernel-heap trong (theo kernel VA).
- * Slot nam o dia chi kernel khong deref duoc tu host nen free list giu o day. */
-struct kmem_slot_node {
-   addr_t kva;
-   struct kmem_slot_node *next;
+struct kmem_chunk {
+    addr_t base;                                  
+    int nfree;                                    
+    int free_head;                                
+    short next_free[KMEM_CHUNK_SLOTS];            
+    unsigned char used[KMEM_CHUNK_SLOTS / 8];     
+    struct kmem_chunk* next;
 };
 
-/*
- * Kernel cache pool struct - pool slot co dinh kich thuoc, grow theo chunk.
- */
 struct kcache_pool_struct {
    int size;
    int align;
@@ -106,8 +120,30 @@ struct kcache_pool_struct {
 
    /* pool slot co dinh, cap phat dong (slab-like) */
    int slots_per_chunk;
-   struct kmem_slot_node *free_list;
+   struct kmem_chunk* chunks;
+   int nchunks;
 };
+
+
+/* =====================================================================
+ * Kernel heap: Kernel VA (Best-Fit) + vùng Kernel theo (pid, reg)
+ * ===================================================================== */
+struct kva_range {
+    addr_t start, end;                
+    struct kva_range* next;
+};
+
+enum kmem_kind { KMEM_POOL = 1, KMEM_DIRECT = 2 };
+struct kmem_region {
+    uint32_t pid;
+    int reg;                           
+    enum kmem_kind kind;
+    int pool_id;                       
+    addr_t kva, size;                  
+    addr_t first_fpn, npages;         
+    struct kmem_region* next;
+};
+
 
 
 /* 
@@ -161,6 +197,10 @@ struct memphy_struct {
    /* Management structure */
    struct framephy_struct *free_fp_list;
    struct framephy_struct *used_fp_list;
+
+   addr_t numfp;                
+   addr_t nfree;                
+   unsigned char* fp_bitmap;    
 };
 
 #endif
