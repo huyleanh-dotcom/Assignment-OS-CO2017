@@ -332,10 +332,6 @@ static void read_config(const char * path) {
 	 * Format: (size=0 result non-used memswap, must have RAM and at least 1 SWAP)
 	 *        MEM_RAM_SZ MEM_SWP0_SZ MEM_SWP1_SZ MEM_SWP2_SZ MEM_SWP3_SZ
 	*/
-	fscanf(file, FORMAT_ARG "\n", &memramsz);
-	for(sit = 0; sit < PAGING_MAX_MMSWP; sit++)
-		fscanf(file, FORMAT_ARG, &(memswpsz[sit])); 
-
 	/* The memory line has 5 numbers, while a process line has the form
 	 * [time] [name] [prio]. If the second line is not a memory line,
 	 * keep the default sizes and leave the line for the process loop. */
@@ -351,6 +347,10 @@ static void read_config(const char * path) {
 	} else {
 		fseek(file, line_start, SEEK_SET);
 	}
+#endif
+#endif
+
+#ifdef MLQ_SCHED
 	ld_processes.prio = (unsigned long*)
 		malloc(sizeof(unsigned long) * num_processes);
 #endif
