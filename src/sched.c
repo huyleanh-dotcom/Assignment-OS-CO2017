@@ -57,57 +57,49 @@ void init_scheduler(void) {
  *  State representation   prio = 0 .. MAX_PRIO, curr_slot = 0..(MAX_PRIO - prio)
  */
 
-static int curr_prio; /* queue currently served; guarded by queue_lock */
 
-/* 1 if a process of level PRIO is running on some CPU; caller holds queue_lock. */
-static int prio_running(int prio)
-{
-	int i;
 
-	for (i = 0; i < running_list.size; i++)
-	{
-		if (running_list.proc[i]->prio == (uint32_t)prio)
-		{
-			return 1;
-		}
-	}
-	return 0;
-}
 
 struct pcb_t * get_mlq_proc(void) {
 	struct pcb_t * proc = NULL;
-	int start, i, k;
+	int i, pass, has_proc;
 	pthread_mutex_lock(&queue_lock);
 	/*TODO: get a process from PRIORITY [ready_queue].
 	 *      It worth to protect by a mechanism.
 	 * */
-	start = curr_prio;
-	for (i = 0; i <= MAX_PRIO; i++)
+	/* At most two passes: the second pass runs only after a slot reset */
+	for (pass = 0; pass < 2 && proc == NULL; pass++) 
 	{
-		if (!empty(&mlq_ready_queue[curr_prio]) && slot[curr_prio] > 0)
+		has_proc = 0;
+		/* Always scan from the highest priority (prio = 0) */
+		for (i = 0; i < MAX_PRIO; i++) 
 		{
-			proc = dequeue(&mlq_ready_queue[curr_prio]);
-			slot[curr_prio]--;
-			break;
-		}
-		if (empty(&mlq_ready_queue[curr_prio]) && prio_running(curr_prio))
-		{
-			for (k = 1; k < MAX_PRIO && proc == NULL; k++)
+			if (empty(&mlq_ready_queue[i]))
 			{
-				proc = dequeue(&mlq_ready_queue[(curr_prio + k) % MAX_PRIO]);
+				continue;
 			}
-			break;
+			has_proc = 1;
+			if (slot[i] > 0) 
+			{
+				proc = dequeue(&mlq_ready_queue[i]);
+				slot[i]--;          /* one dispatch consumes one slot */
+				break;
+			}
 		}
-		slot[curr_prio] = MAX_PRIO - curr_prio;
-		curr_prio = (curr_prio + 1) % MAX_PRIO;
+		if (!has_proc)
+		{
+			break;                  /* all queues are empty */
+		}
+		if (proc == NULL) 
+		{
+			/* Every non-empty queue is out of slot: reset all 140 queues */
+			for (i = 0; i < MAX_PRIO; i++)
+				slot[i] = MAX_PRIO - i;
+		}
 	}
 	if (proc != NULL)
 	{
 		enqueue(&running_list, proc);
-	}
-	else
-	{
-		curr_prio = start; /* all queues empty: an idle CPU must not move the cursor */
 	}
 	pthread_mutex_unlock(&queue_lock);
 	return proc;	
