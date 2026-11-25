@@ -316,17 +316,13 @@ static void read_config(const char * path) {
 		malloc(sizeof(unsigned long) * num_processes);
 #ifdef MM_PAGING
 	int sit;
-#ifdef MM_FIXED_MEMSZ
-	/* We provide here a back compatible with legacy OS simulatiom config file
-         * In which, it have no addition config line for Mema, keep only one line
-	 * for legacy info 
-         *  [time slice] [N = Number of CPU] [M = Number of Processes to be run]
-         */
-        memramsz  =  0x100000000;
-        memswpsz[0] = 0x1000000;
-	for(sit = 1; sit < PAGING_MAX_MMSWP; sit++)
+	/* Default memory sizes, used when the config file has no memory line
+	 * (legacy format, e.g. input/sched): 4 GB RAM and one 16 MB SWAP */
+	memramsz = 0x100000000;
+	memswpsz[0] = 0x1000000;
+	for (sit = 1; sit < PAGING_MAX_MMSWP; sit++)
 		memswpsz[sit] = 0;
-#else
+#ifndef MM_FIXED_MEMSZ
 #ifdef MM64_KERNEL_BASE_IN_CONFIG
 	/* format mo rong (spec 2.2.5): dong KERNEL_BASE truoc mem sizes.
 	 * Input mau khong co dong nay nen mac dinh dung KERNEL_BASE_ADDR (macOS). */
@@ -340,11 +336,21 @@ static void read_config(const char * path) {
 	for(sit = 0; sit < PAGING_MAX_MMSWP; sit++)
 		fscanf(file, FORMAT_ARG, &(memswpsz[sit])); 
 
-       fscanf(file, "\n"); /* Final character */
-#endif
-#endif
-
-#ifdef MLQ_SCHED
+	/* The memory line has 5 numbers, while a process line has the form
+	 * [time] [name] [prio]. If the second line is not a memory line,
+	 * keep the default sizes and leave the line for the process loop. */
+	long line_start = ftell(file);
+	char line[256];
+	arg_t mem[1 + PAGING_MAX_MMSWP];
+	if (fgets(line, sizeof(line), file) != NULL &&
+	    sscanf(line, FORMAT_ARG " " FORMAT_ARG " " FORMAT_ARG " " FORMAT_ARG " " FORMAT_ARG,
+	           &mem[0], &mem[1], &mem[2], &mem[3], &mem[4]) == 1 + PAGING_MAX_MMSWP) {
+		memramsz = mem[0];
+		for (sit = 0; sit < PAGING_MAX_MMSWP; sit++)
+			memswpsz[sit] = mem[sit + 1];
+	} else {
+		fseek(file, line_start, SEEK_SET);
+	}
 	ld_processes.prio = (unsigned long*)
 		malloc(sizeof(unsigned long) * num_processes);
 #endif
