@@ -94,7 +94,9 @@ struct pcb_t * get_mlq_proc(void) {
 		{
 			/* Every non-empty queue is out of slot: reset all 140 queues */
 			for (i = 0; i < MAX_PRIO; i++)
+			{
 				slot[i] = MAX_PRIO - i;
+			}
 		}
 	}
 	if (proc != NULL)
