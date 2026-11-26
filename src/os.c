@@ -555,7 +555,7 @@ int main(int argc, char * argv[]) {
 
 	/* Stop timer */
 	stop_timer();
-
+    rtl_dma_cleanup_simulation();
 	return 0;
 
 }
