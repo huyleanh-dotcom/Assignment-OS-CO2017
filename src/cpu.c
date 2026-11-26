@@ -57,7 +57,7 @@ int read(
 	}
 }
 
-int write(
+int cpu_write(
 	struct pcb_t *proc,	// Process executing the instruction
 	BYTE data,		// Data to be written into memory
 	uint32_t destination, // Index of destination register
@@ -128,7 +128,7 @@ switch (ins.opcode)
 #ifdef MM_PAGING
 		stat = libwrite(proc, ins.arg_0, ins.arg_1, ins.arg_2);
 #else
-		stat = write(proc, ins.arg_0, ins.arg_1, ins.arg_2);
+		stat = cpu_write(proc, ins.arg_0, ins.arg_1, ins.arg_2);
 #endif
 		break;
 	case SYSCALL:
