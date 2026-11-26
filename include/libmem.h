@@ -34,6 +34,12 @@ int vm_validate_active_access(struct pcb_t *caller, int vmaid, int rgid,
                               addr_t offset, addr_t size, addr_t *out_vaddr);
 
 /* slab pool kernel heap */
-int    kmem_pool_grow(struct kcache_pool_struct *pool);
-addr_t kmem_pool_alloc_slot(struct kcache_pool_struct *pool);
-int    kmem_pool_free_slot(struct kcache_pool_struct *pool, addr_t kva);
+int    kmem_pool_grow(struct pcb_t* caller, struct kcache_pool_struct *pool);
+addr_t kmem_pool_alloc_slot(struct pcb_t* caller, struct kcache_pool_struct *pool);
+int    kmem_pool_free_slot( struct kcache_pool_struct *pool, addr_t kva);
+int    kmem_pool_index(addr_t size);
+int    kva_alloc(struct krnl_t* krnl, addr_t len, addr_t* start);
+int    kva_free(struct krnl_t* krnl, addr_t start, addr_t len);
+struct kmem_region* kregion_lookup(struct krnl_t* krnl, uint32_t pid, int reg);
+int    __kfree(struct pcb_t* caller, int reg);
+int    kmem_region_phys(struct krnl_t* krnl, uint32_t pid, int reg, addr_t off, addr_t* phys);

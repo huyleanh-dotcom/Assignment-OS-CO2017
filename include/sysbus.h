@@ -51,6 +51,13 @@ int dpi_bank_write32_legacy(long long offset, int value);
 
 // DPI Callback: Called from RTL when DMA transfer completes
 void dma_done_callback(void);
+
+struct memphy_struct;
+void sysbus_set_os_mram(struct memphy_struct *mram);
+
+void dma_record_last_transfer(uint64_t src, uint64_t dst, uint64_t length,
+                              struct memphy_struct *mram, int use_os_mram);
+
 #ifdef __cplusplus
 }
 #endif

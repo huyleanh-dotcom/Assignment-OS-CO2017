@@ -29,7 +29,7 @@
 
 static int time_slot;
 static int num_cpus;
-static int done = 0;
+static volatile int done = 0;
 static struct krnl_t os;
 
 /* Global MM lock + registry PID->PCB.
@@ -140,12 +140,44 @@ struct pcb_t *registry_iter(struct krnl_t *krnl, int *cursor)
 	return found;
 }
 
+/*
+ * registry_foreach_process - duyệt mọi process đang đăng ký
+ *   Chép con trỏ PCB ra mảng tạm dưới os_mm_lock, rồi gọi cb NGOÀI lock:
+ *   cb được phép lấy lock khác mà không giữ os_mm_lock lâu.
+ *   cb trả != 0 -> dừng. Trả số process đã gọi cb, -1 nếu tham số sai.
+ *
+ *   Con trỏ chỉ còn hợp lệ khi bên gọi giữ mmvm_lock: process thoát làm
+ *   registry_unregister TRƯỚC rồi mới free_pcb_memph (cần mmvm_lock) và
+ *   free(mm), nên không thể bị giải phóng giữa chừng.
+ *   Thứ tự lock toàn hệ thống: mmvm_lock -> os_mm_lock (không bao giờ ngược).
+ */
+int registry_foreach_process(struct krnl_t* krnl, int (*cb)(struct pcb_t*, void*), void* ctx)
+{
+	struct pcb_t* snap[MAX_PROC];
+	int i, n = 0;
+
+	if (krnl == NULL || cb == NULL) return -1;
+	pthread_mutex_lock(&os_mm_lock);
+	for (i = 0; i < MAX_PROC; i++)
+		if (krnl->pid_table[i] != NULL && krnl->pid_table[i] != REG_TOMBSTONE)
+			snap[n++] = krnl->pid_table[i];
+	pthread_mutex_unlock(&os_mm_lock);
+
+	for (i = 0; i < n; i++)
+		if (cb(snap[i], ctx) != 0) return i + 1;
+	return n;
+}
+
 /* don dep tap trung khi process exit: go registry roi giai phong user mm */
 void kernel_cleanup_process(struct pcb_t *proc)
 {
 	if (proc == NULL) return;
 	registry_unregister(&os, proc->pid);
-	/* P1 them pt_destroy_tree(proc->mm); P3 them free_pcb_memph(proc) tai day */
+#ifdef MM_PAGING
+/* trả frame RAM + SWAP slot, rồi pt_destroy_tree; cần proc->mm còn sống */
+	kmem_release_process(proc);
+	free_pcb_memph(proc);
+#endif
 	if (proc->mm != NULL) {
 		struct vm_area_struct *vma = proc->mm->mmap;
 		while (vma != NULL) {
@@ -168,11 +200,50 @@ struct mmpaging_ld_args {
 	/* A dispatched argument struct to compact many-fields passing to loader */
 	int vmemsz;
 	struct memphy_struct *mram;
-	struct memphy_struct **mswp;
+	struct memphy_struct *mswp[PAGING_MAX_MMSWP];
 	struct memphy_struct *active_mswp;
 	int active_mswp_id;
 	struct timer_id_t  *timer_id;
 };
+
+/* Keep the pointer table alive for as long as the loader arguments. */
+static int
+init_memory_devices (struct mmpaging_ld_args *args,
+                     struct memphy_struct *ram,
+                     struct memphy_struct swaps[PAGING_MAX_MMSWP])
+{
+  int id;
+
+  args->mram = ram;
+  args->active_mswp = NULL;
+  args->active_mswp_id = -1;
+  for (id = 0; id < PAGING_MAX_MMSWP; id++)
+    args->mswp[id] = NULL;
+
+  if (init_memphy (ram, memramsz, 1) != 0)
+    return -1;
+
+  for (id = 0; id < PAGING_MAX_MMSWP; id++)
+    {
+      if (init_memphy (&swaps[id], memswpsz[id], 1) != 0)
+        return -1;
+#ifdef MM64
+      if (swaps[id].maxsz < PAGING64_PAGESZ)
+#else
+      if (swaps[id].maxsz < PAGING_PAGESZ)
+#endif
+        continue;
+
+      args->mswp[id] = &swaps[id];
+      if (args->active_mswp == NULL)
+        {
+          args->active_mswp = &swaps[id];
+          args->active_mswp_id = id;
+        }
+    }
+
+  return ram->maxsz > 0 && args->active_mswp != NULL ? 0 : -1;
+}
 #endif
 
 static struct ld_args{
@@ -201,16 +272,18 @@ static void * cpu_routine(void * args) {
 			/* No process is running, the we load new process from
 		 	* ready queue */
 			proc = get_proc();
-			if (proc == NULL) {
-                           next_slot(timer_id);
-                           continue; /* First load failed. skip dummy load */
-                        }
+			//if (proc == NULL) {
+   //                        next_slot(timer_id);
+   //                        continue; /* First load failed. skip dummy load */
+   //                     }
 		}else if (proc->pc == proc->code->size) {
 			/* The porcess has finish it job */
 			printf("\tCPU %d: Processed %2d has finished\n",
 				id ,proc->pid);
 			finish_proc(proc);
+
 			kernel_cleanup_process(proc);   /* don dep mm + registry */
+
 			free(proc);
 			proc = get_proc();
 			time_left = 0;
@@ -278,7 +351,7 @@ static void * ld_routine(void * args) {
 	int i = 0;
   /* TODO init kernel page table directory */
 #ifdef MM64
-	os.krnl_pgd = (addr_t*)malloc(PAGING64_MAX_PGN * sizeof(addr_t));
+	os.krnl_pgd = NULL;
 	os.krnl_p4d = NULL;
 	os.krnl_pud = NULL;
 	os.krnl_pmd = NULL;
@@ -291,8 +364,12 @@ static void * ld_routine(void * args) {
 	os.mram = mram;
 	os.mswp = mswp;
 	os.active_mswp = active_mswp;
+	os.active_mswp_id = ((struct mmpaging_ld_args *)args)->active_mswp_id;
 	os.mm = (struct mm_struct*)malloc(sizeof(struct mm_struct));
 	init_mm(os.mm, NULL);
+#ifdef MM64
+	os.krnl_pgd = os.mm->pgd;   /* Kernel PGD chung, alias */
+#endif
 	while (i < num_processes) {
 		struct pcb_t * proc = load(ld_processes.path[i]);
 		proc->krnl = &os;
@@ -336,17 +413,14 @@ static void read_config(const char * path) {
 		malloc(sizeof(unsigned long) * num_processes);
 #ifdef MM_PAGING
 	int sit;
-#ifdef MM_FIXED_MEMSZ
-	/* We provide here a back compatible with legacy OS simulatiom config file
-         * In which, it have no addition config line for Mema, keep only one line
-	 * for legacy info 
-         *  [time slice] [N = Number of CPU] [M = Number of Processes to be run]
-         */
-        memramsz  =  0x100000000;
-        memswpsz[0] = 0x1000000;
-	for(sit = 1; sit < PAGING_MAX_MMSWP; sit++)
+	/* Default memory sizes, used when the config file has no memory line
+	 * (legacy format, e.g. input/sched): 2 MiB RAM and one 16 MiB SWAP.
+	 * Keep RAM within the int-sized memphy_struct.maxsz. */
+	memramsz = PAGING_MEMRAMSZ;
+	memswpsz[0] = 0x1000000;
+	for (sit = 1; sit < PAGING_MAX_MMSWP; sit++)
 		memswpsz[sit] = 0;
-#else
+#ifndef MM_FIXED_MEMSZ
 #ifdef MM64_KERNEL_BASE_IN_CONFIG
 	/* format mo rong (spec 2.2.5): dong KERNEL_BASE truoc mem sizes.
 	 * Input mau khong co dong nay nen mac dinh dung KERNEL_BASE_ADDR (macOS). */
@@ -356,11 +430,21 @@ static void read_config(const char * path) {
 	 * Format: (size=0 result non-used memswap, must have RAM and at least 1 SWAP)
 	 *        MEM_RAM_SZ MEM_SWP0_SZ MEM_SWP1_SZ MEM_SWP2_SZ MEM_SWP3_SZ
 	*/
-	fscanf(file, FORMAT_ARG "\n", &memramsz);
-	for(sit = 0; sit < PAGING_MAX_MMSWP; sit++)
-		fscanf(file, FORMAT_ARG, &(memswpsz[sit])); 
-
-       fscanf(file, "\n"); /* Final character */
+	/* The memory line has 5 numbers, while a process line has the form
+	 * [time] [name] [prio]. If the second line is not a memory line,
+	 * keep the default sizes and leave the line for the process loop. */
+	long line_start = ftell(file);
+	char line[256];
+	arg_t mem[1 + PAGING_MAX_MMSWP];
+	if (fgets(line, sizeof(line), file) != NULL &&
+	    sscanf(line, FORMAT_ARG " " FORMAT_ARG " " FORMAT_ARG " " FORMAT_ARG " " FORMAT_ARG,
+	           &mem[0], &mem[1], &mem[2], &mem[3], &mem[4]) == 1 + PAGING_MAX_MMSWP) {
+		memramsz = mem[0];
+		for (sit = 0; sit < PAGING_MAX_MMSWP; sit++)
+			memswpsz[sit] = mem[sit + 1];
+	} else {
+		fseek(file, line_start, SEEK_SET);
+	}
 #endif
 #endif
 
@@ -397,19 +481,21 @@ int main(int argc, char * argv[]) {
 
 	/* khoi tao registry + kernel cache pools truoc khi cac thread chay */
 	memset(os.pid_table, 0, sizeof(os.pid_table));
-#define NUM_KCACHE_POOL 5
+
 	os.kcpooltbl = (struct kcache_pool_struct*)
-		calloc(NUM_KCACHE_POOL, sizeof(struct kcache_pool_struct));
+		calloc(KMEM_NUM_POOLS, sizeof(struct kcache_pool_struct));
 	{
-		int kp_sizes[NUM_KCACHE_POOL] = {32, 64, 128, 256, 512};
+		int kp_sizes[KMEM_NUM_POOLS] = { 16, 32, 64, 96, 128, 192, 256, 512, 1024, 2048 };
 		int kp;
-		for (kp = 0; kp < NUM_KCACHE_POOL; kp++) {
+		for (kp = 0; kp < KMEM_NUM_POOLS; kp++) {
 			os.kcpooltbl[kp].size = kp_sizes[kp];
-			os.kcpooltbl[kp].align = 8;
-			os.kcpooltbl[kp].slots_per_chunk = 8;
-			os.kcpooltbl[kp].free_list = NULL;
+			os.kcpooltbl[kp].align = 16;
+			os.kcpooltbl[kp].slots_per_chunk = KMEM_CHUNK_SIZE / kp_sizes[kp];
+			os.kcpooltbl[kp].chunks = NULL;
+			os.kcpooltbl[kp].nchunks = 0;
 		}
 	}
+
 
 	pthread_t * cpu = (pthread_t*)malloc(num_cpus * sizeof(pthread_t));
 	pthread_t * dma = (pthread_t*)malloc(sizeof(pthread_t));
@@ -428,27 +514,18 @@ int main(int argc, char * argv[]) {
 
 #ifdef MM_PAGING
 	/* Init all MEMPHY include 1 MEMRAM and n of MEMSWP */
-	int rdmflag = 1; /* By default memphy is RANDOM ACCESS MEMORY */
-
-	struct memphy_struct mram;
-	struct memphy_struct mswp[PAGING_MAX_MMSWP];
-
-	/* Create MEM RAM */
-	init_memphy(&mram, memramsz, rdmflag);
-
-        /* Create all MEM SWAP */ 
-	int sit;
-	for(sit = 0; sit < PAGING_MAX_MMSWP; sit++)
-	       init_memphy(&mswp[sit], memswpsz[sit], rdmflag);
+	struct memphy_struct mram = {0};
+	struct memphy_struct mswp[PAGING_MAX_MMSWP] = {0};
 
 	/* In Paging mode, it needs passing the system mem to each PCB through loader*/
-	struct mmpaging_ld_args *mm_ld_args = (struct mmpaging_ld_args*)malloc(sizeof(struct mmpaging_ld_args));
+	struct mmpaging_ld_args *mm_ld_args = calloc(1, sizeof(*mm_ld_args));
+	if (mm_ld_args == NULL || init_memory_devices(mm_ld_args, &mram, mswp) != 0)
+	{
+		fprintf(stderr, "Cannot initialize RAM/SWAP: require positive RAM and a usable SWAP device\n");
+		exit(EXIT_FAILURE);
+	}
 
 	mm_ld_args->timer_id = ld_event;
-	mm_ld_args->mram = (struct memphy_struct *) &mram;
-	mm_ld_args->mswp = (struct memphy_struct**) &mswp;
-	mm_ld_args->active_mswp = (struct memphy_struct *) &mswp[0];
-        mm_ld_args->active_mswp_id = 0;
 
 
 #endif

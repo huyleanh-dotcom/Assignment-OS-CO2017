@@ -15,6 +15,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "sysbus.h"
+#include  "pthread.h"
+
+#include "common.h"
+#include "os-mm.h"
 
 // Maximum number of memory banks supported
 #define MAX_MEMORY_BANKS 8
@@ -115,6 +119,7 @@ extern "C" {
 /**
  * DPI Callback: Called from RTL when DMA read access
  */
+/*
 int dpi_bank_read32_legacy(long long offset) {
     uint8_t data[4] = {0};
 
@@ -128,10 +133,11 @@ int dpi_bank_read32_legacy(long long offset) {
 
     return  *((uint32_t*)data);
 }
-
+*/
 /**
  * DPI Callback: Called from RTL when DMA write access
  */
+/*
 int dpi_bank_write32_legacy(long long offset, int value) {
     void* dst = memory_bank_get_ptr((size_t)offset);
     //printf("MEM WRITE RESULT: Address=%p, Write data=%x, Write rc=0, Readback=%x, Match=1\n",
@@ -141,17 +147,144 @@ int dpi_bank_write32_legacy(long long offset, int value) {
        
     return 0;
 }
+    */
+   
+   static struct memphy_struct *g_os_mram = NULL;
 
+void sysbus_set_os_mram(struct memphy_struct *mram) {
+    g_os_mram = mram;
+}
+
+static void* sysbus_resolve_os_ptr(uint64_t offset, size_t access_len) {
+    if (g_os_mram == NULL || g_os_mram->storage == NULL || g_os_mram->maxsz <= 0) {
+        return NULL;
+    }
+    uint64_t maxsz = (uint64_t)g_os_mram->maxsz;
+    if (offset >= maxsz || access_len > maxsz - offset) {
+        return NULL;
+    }
+    return (void *)(g_os_mram->storage + offset);
+}
+
+int dpi_bank_read32_legacy(long long offset) {
+    uint8_t data[4] = {0};
+
+    if (offset < 0) {
+        return 0;
+    }
+
+    void* src = memory_bank_get_ptr((size_t)offset);
+    if (!src) {
+        src = sysbus_resolve_os_ptr((uint64_t)offset, 4);
+    }
+    if (!src) {
+        return 0;
+    }
+
+    memcpy(data, src, 4);
+    return *((uint32_t*)data);
+}
+
+int dpi_bank_write32_legacy(long long offset, int value) {
+    if (offset < 0) {
+        return -1;
+    }
+
+    void* dst = memory_bank_get_ptr((size_t)offset);
+    if (!dst) {
+        dst = sysbus_resolve_os_ptr((uint64_t)offset, 4);
+    }
+    if (!dst) {
+        return -1;
+    }
+
+    memcpy(dst, &value, 4);
+    return 0;
+}
+
+static pthread_mutex_t g_dma_info_mtx = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_last_dma_src = 0;
+static uint64_t g_last_dma_dst = 0;
+static uint64_t g_last_dma_len = 0;
+static struct memphy_struct *g_last_dma_mram = NULL;
+static int g_last_dma_use_os_mram = 0;
+static int g_has_last_dma = 0;
+
+void dma_record_last_transfer(uint64_t src, uint64_t dst, uint64_t length,
+                              struct memphy_struct *mram, int use_os_mram)
+{
+    pthread_mutex_lock(&g_dma_info_mtx);
+    g_last_dma_src = src;
+    g_last_dma_dst = dst;
+    g_last_dma_len = length;
+    g_last_dma_mram = mram;
+    g_last_dma_use_os_mram = use_os_mram;
+    g_has_last_dma = 1;
+    pthread_mutex_unlock(&g_dma_info_mtx);
+}
 
 /**
  * DPI Callback: Called from RTL when DMA transfer completes
  */
 void dma_done_callback(void)
 {
+    uint64_t dst_off = 0;
+    uint64_t len = 0;
+    struct memphy_struct *mram = NULL;
+    int use_os_mram = 0;
+    int has_info = 0;
+
+    pthread_mutex_lock(&g_dma_info_mtx);
+    dst_off = g_last_dma_dst;
+    len = g_last_dma_len;
+    mram = g_last_dma_mram;
+    use_os_mram = g_last_dma_use_os_mram;
+    has_info = g_has_last_dma;
+    pthread_mutex_unlock(&g_dma_info_mtx);
+
+    printf("DMA completed\n");
+
+    if (has_info && len > 0) {
+        const uint8_t *pdst = NULL;
+        uint64_t max_len = 0;
+
+        if (memory_bank_is_available()) {
+            pdst = (const uint8_t *)memory_bank_get_ptr(dst_off);
+            max_len = len;
+        } else if (use_os_mram && mram != NULL && mram->storage != NULL && mram->maxsz > 0) {
+            uint64_t maxsz = (uint64_t)mram->maxsz;
+            if (dst_off < maxsz) {
+                pdst = (const uint8_t *)(mram->storage + dst_off);
+                max_len = (len < maxsz - dst_off) ? len : (maxsz - dst_off);
+            }
+        }
+
+        if (pdst != NULL && max_len > 0) {
+            uint64_t show = (max_len < 8) ? max_len : 8;
+            printf("  dst @ %llu (len=%llu): ",
+                   (unsigned long long)dst_off,
+                   (unsigned long long)len);
+            for (uint64_t i = 0; i < show; i++) {
+                printf("0x%02x%s", pdst[i], (i + 1 < show) ? " " : "");
+            }
+            printf("\n");
+        }
+    }
+
+    fflush(stdout);
+}
+
+
+/**
+ * DPI Callback: Called from RTL when DMA transfer completes
+ */
+/*
+void dma_done_callback(void)
+{
     printf("DMA completed\n");
     fflush(stdout);   // keep ordering vs. printf_IMPORTANT output
 }
-
+*/
 #ifdef __cplusplus
 }
 #endif

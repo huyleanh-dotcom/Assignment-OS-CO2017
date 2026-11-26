@@ -139,6 +139,9 @@ struct krnl_t
 	struct memphy_struct *active_mswp;
 	uint32_t active_mswp_id;
 	struct kcache_pool_struct *kcpooltbl;
+	addr_t kva_brk;             // 0 is not initialized, the first address of kernel heap       
+	struct kva_range* kva_free;       
+	struct kmem_region* kregions;     
 
 	/* registry PID->PCB: syscall nhan PID, tra PCB that o day
 	 * (khong tin con tro PCB tu user). Lock bao ve: os_mm_lock (os.c). */
@@ -160,19 +163,16 @@ struct krnl_t
 int  registry_register(struct krnl_t *krnl, struct pcb_t *proc);
 struct pcb_t *registry_lookup(struct krnl_t *krnl, uint32_t pid);
 int  registry_unregister(struct krnl_t *krnl, uint32_t pid);
-/* duyet cac PCB con song: *cursor khoi tao 0, tra NULL khi het */
+/* *cursor starts at 0; returns NULL after the last live process. */
 struct pcb_t *registry_iter(struct krnl_t *krnl, int *cursor);
-/* duyet PCB con song, goi callback duoi lock (an toan cho global reclaim);
- * callback tra khac 0 de dung som. callback KHONG duoc goi lai cac ham registry hay lock. */
+/* Callback runs under os_mm_lock and must not acquire registry/MM locks. */
 int registry_for_each_locked(struct krnl_t *krnl,
                              int (*callback)(struct pcb_t *, void *), void *arg);
-
-/* expose global MM lock cho P3 (khoa lookup+truy cap chung mot vung toi han) */
+/* Caller holds mmvm_lock while callbacks use PCB/mm from the snapshot. */
+int registry_foreach_process(struct krnl_t *krnl,
+                             int (*cb)(struct pcb_t *, void *), void *ctx);
 int mm_global_lock(void);
 int mm_global_unlock(void);
-
-/* dia chi goc kernel space (macOS-style), dinh nghia trong os.c, doc tu config.
- * P1 dung de phan loai VA user/kernel va map kernel. */
 extern unsigned long kernel_base;
 
 
