@@ -4,6 +4,7 @@
 #undef main
 
 #include <assert.h>
+#include "libmem.h"
 
 static void
 destroy_device (struct memphy_struct *device)
@@ -138,9 +139,75 @@ check_disabled_swaps (void)
     }
 }
 
+static int
+count_process (struct pcb_t *p, void *ctx)
+{
+  assert (p != NULL && p != REG_TOMBSTONE);
+  (*(int *)ctx)++;
+  return 0;
+}
+
+static void
+check_merge_regressions (void)
+{
+  struct krnl_t kernel = {0};
+  struct pcb_t a = {.pid = 1}, b = {.pid = 1 + MAX_PROC};
+  struct pcb_t c = {.pid = 1 + 2 * MAX_PROC};
+  int count = 0, cursor = 0;
+  assert (registry_register (&kernel, &a) == 0);
+  assert (registry_register (&kernel, &b) == 0);
+  assert (registry_unregister (&kernel, a.pid) == 0);
+  assert (registry_lookup (&kernel, b.pid) == &b);
+  assert (registry_foreach_process (&kernel, count_process, &count) == 1);
+  assert (count == 1);
+  count = 0;
+  assert (registry_for_each_locked (&kernel, count_process, &count) == 0);
+  assert (count == 1);
+  assert (registry_iter (&kernel, &cursor) == &b);
+  assert (registry_iter (&kernel, &cursor) == NULL);
+  assert (registry_register (&kernel, &b) == -1);
+  assert (registry_register (&kernel, &c) == 0);
+  assert (registry_lookup (&kernel, c.pid) == &c);
+
+  struct mm_struct mm = {0};
+  struct pcb_t process = {.mm = &mm};
+  addr_t va = 0;
+  mm.symrgtbl[0].active = 1;
+  mm.symrgtbl[0].vmaid = 0;
+  mm.symrgtbl[0].rg_start = 100;
+  mm.symrgtbl[0].rg_end = 110;
+  assert (vm_validate_active_region (&process, 0, 9) == 0);
+  assert (vm_validate_active_region (&process, 0, 10) == -1);
+  assert (vm_validate_active_region (&process, -1, 0) == -1);
+  assert (vm_validate_active_access (&process, 0, 0, 8, 2, &va) == 0);
+  assert (va == 108);
+  assert (vm_validate_active_access (&process, 0, 0, 8, 3, &va) == -1);
+  assert (vm_validate_active_access (&process, 1, 0, 0, 1, &va) == -1);
+  assert (vm_validate_active_access (&process, 0, 0, 0, (addr_t)-1, &va) == -1);
+  mm.symrgtbl[0].active = 0;
+  assert (vm_validate_active_region (&process, 0, 0) == -1);
+  mm.symrgtbl[0].active = 1;
+  mm.symrgtbl[0].rg_start = kernel_base;
+  mm.symrgtbl[0].rg_end = kernel_base + 10;
+  assert (vm_validate_active_access (&process, 0, 0, 0, 1, &va) == -1);
+
+  addr_t first, second, reused;
+  assert (kva_alloc (&kernel, PAGING64_PAGESZ, &first) == 0);
+  assert (first == kernel_base);
+  assert (kva_alloc (&kernel, PAGING64_PAGESZ, &second) == 0);
+  assert (kva_free (&kernel, first, PAGING64_PAGESZ) == 0);
+  assert (kva_alloc (&kernel, PAGING64_PAGESZ, &reused) == 0);
+  assert (reused == first);
+  assert (kva_free (&kernel, second, PAGING64_PAGESZ) == 0);
+  assert (kva_free (&kernel, first, PAGING64_PAGESZ) == 0);
+  assert (kernel.kva_free == NULL && kernel.kva_brk == kernel_base);
+  puts ("Merge regression: PASS (registry collisions/tombstones, access bounds, KVA reuse)");
+}
+
 int
 main (void)
 {
+  check_merge_regressions ();
   check_roundtrip (0);
   check_roundtrip (1);
   check_roundtrip (3);
