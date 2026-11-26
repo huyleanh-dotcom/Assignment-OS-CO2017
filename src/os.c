@@ -143,11 +143,50 @@ struct mmpaging_ld_args {
 	/* A dispatched argument struct to compact many-fields passing to loader */
 	int vmemsz;
 	struct memphy_struct *mram;
-	struct memphy_struct **mswp;
+	struct memphy_struct *mswp[PAGING_MAX_MMSWP];
 	struct memphy_struct *active_mswp;
 	int active_mswp_id;
 	struct timer_id_t  *timer_id;
 };
+
+/* Keep the pointer table alive for as long as the loader arguments. */
+static int
+init_memory_devices (struct mmpaging_ld_args *args,
+                     struct memphy_struct *ram,
+                     struct memphy_struct swaps[PAGING_MAX_MMSWP])
+{
+  int id;
+
+  args->mram = ram;
+  args->active_mswp = NULL;
+  args->active_mswp_id = -1;
+  for (id = 0; id < PAGING_MAX_MMSWP; id++)
+    args->mswp[id] = NULL;
+
+  if (init_memphy (ram, memramsz, 1) != 0)
+    return -1;
+
+  for (id = 0; id < PAGING_MAX_MMSWP; id++)
+    {
+      if (init_memphy (&swaps[id], memswpsz[id], 1) != 0)
+        return -1;
+#ifdef MM64
+      if (swaps[id].maxsz < PAGING64_PAGESZ)
+#else
+      if (swaps[id].maxsz < PAGING_PAGESZ)
+#endif
+        continue;
+
+      args->mswp[id] = &swaps[id];
+      if (args->active_mswp == NULL)
+        {
+          args->active_mswp = &swaps[id];
+          args->active_mswp_id = id;
+        }
+    }
+
+  return ram->maxsz > 0 && args->active_mswp != NULL ? 0 : -1;
+}
 #endif
 
 static struct ld_args{
@@ -268,6 +307,7 @@ static void * ld_routine(void * args) {
 	os.mram = mram;
 	os.mswp = mswp;
 	os.active_mswp = active_mswp;
+	os.active_mswp_id = ((struct mmpaging_ld_args *)args)->active_mswp_id;
 	os.mm = (struct mm_struct*)malloc(sizeof(struct mm_struct));
 	init_mm(os.mm, NULL);
 #ifdef MM64
@@ -317,8 +357,9 @@ static void read_config(const char * path) {
 #ifdef MM_PAGING
 	int sit;
 	/* Default memory sizes, used when the config file has no memory line
-	 * (legacy format, e.g. input/sched): 4 GB RAM and one 16 MB SWAP */
-	memramsz = 0x100000000;
+	 * (legacy format, e.g. input/sched): 2 MiB RAM and one 16 MiB SWAP.
+	 * Keep RAM within the int-sized memphy_struct.maxsz. */
+	memramsz = PAGING_MEMRAMSZ;
 	memswpsz[0] = 0x1000000;
 	for (sit = 1; sit < PAGING_MAX_MMSWP; sit++)
 		memswpsz[sit] = 0;
@@ -416,27 +457,18 @@ int main(int argc, char * argv[]) {
 
 #ifdef MM_PAGING
 	/* Init all MEMPHY include 1 MEMRAM and n of MEMSWP */
-	int rdmflag = 1; /* By default memphy is RANDOM ACCESS MEMORY */
-
-	struct memphy_struct mram;
-	struct memphy_struct mswp[PAGING_MAX_MMSWP];
-
-	/* Create MEM RAM */
-	init_memphy(&mram, memramsz, rdmflag);
-
-        /* Create all MEM SWAP */ 
-	int sit;
-	for(sit = 0; sit < PAGING_MAX_MMSWP; sit++)
-	       init_memphy(&mswp[sit], memswpsz[sit], rdmflag);
+	struct memphy_struct mram = {0};
+	struct memphy_struct mswp[PAGING_MAX_MMSWP] = {0};
 
 	/* In Paging mode, it needs passing the system mem to each PCB through loader*/
-	struct mmpaging_ld_args *mm_ld_args = (struct mmpaging_ld_args*)malloc(sizeof(struct mmpaging_ld_args));
+	struct mmpaging_ld_args *mm_ld_args = calloc(1, sizeof(*mm_ld_args));
+	if (mm_ld_args == NULL || init_memory_devices(mm_ld_args, &mram, mswp) != 0)
+	{
+		fprintf(stderr, "Cannot initialize RAM/SWAP: require positive RAM and a usable SWAP device\n");
+		exit(EXIT_FAILURE);
+	}
 
 	mm_ld_args->timer_id = ld_event;
-	mm_ld_args->mram = (struct memphy_struct *) &mram;
-	mm_ld_args->mswp = (struct memphy_struct**) &mswp;
-	mm_ld_args->active_mswp = (struct memphy_struct *) &mswp[0];
-        mm_ld_args->active_mswp_id = 0;
 
 
 #endif

@@ -529,12 +529,15 @@ int pg_getpage(struct mm_struct* mm, addr_t pgn, addr_t* fpn, struct pcb_t* call
     if (rc != PT_STATUS_SWAPPED)
         return -1;                       /* chưa map / không có quyền */
 
+    swp = pt_swap_dev(caller->krnl, t.swptyp);
+    if (swp == NULL)
+        return -1;
+
     /* 1. frame đích: RAM trống -> reclaim theo tầng như alloc_pages_range */
     if (pg_get_frame(caller, &tgtfpn) != 0)
         return -1;
 
     /* 2. SWAP -> RAM, 3. commit PTE (pt_swapin_commit tự enlist fifo_pgn) */
-    swp = pt_swap_dev(caller->krnl, t.swptyp);
     if (__swap_cp_page(swp, t.swpoff, caller->krnl->mram, tgtfpn) != 0 ||
         pt_swapin_commit(caller, va, tgtfpn) != PT_STATUS_OK) {
         MEMPHY_put_freefp(caller->krnl->mram, tgtfpn);
@@ -1803,10 +1806,10 @@ static enum pt_iter_action pt_cleanup_collect(addr_t va,
 }
 static struct memphy_struct* pt_swap_dev(struct krnl_t* krnl, int swptyp)
 {
-    if (krnl->mswp != NULL && swptyp >= 0 && swptyp < PAGING_MAX_MMSWP &&
-        krnl->mswp[swptyp] != NULL)
-        return krnl->mswp[swptyp];
-    return krnl->active_mswp;
+    if (krnl == NULL || krnl->mswp == NULL
+        || swptyp < 0 || swptyp >= PAGING_MAX_MMSWP)
+        return NULL;
+    return krnl->mswp[swptyp];
 }
 /*
  * free_pcb_memph - thu hồi TOÀN BỘ bộ nhớ User của một process
