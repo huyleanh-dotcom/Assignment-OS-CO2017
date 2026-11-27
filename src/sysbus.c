@@ -201,79 +201,56 @@ int dpi_bank_write32_legacy(long long offset, int value) {
     memcpy(dst, &value, 4);
     return 0;
 }
-
-static pthread_mutex_t g_dma_info_mtx = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t g_last_dma_src = 0;
-static uint64_t g_last_dma_dst = 0;
-static uint64_t g_last_dma_len = 0;
-static struct memphy_struct *g_last_dma_mram = NULL;
-static int g_last_dma_use_os_mram = 0;
-static int g_has_last_dma = 0;
-
-void dma_record_last_transfer(uint64_t src, uint64_t dst, uint64_t length,
-                              struct memphy_struct *mram, int use_os_mram)
-{
-    pthread_mutex_lock(&g_dma_info_mtx);
-    g_last_dma_src = src;
-    g_last_dma_dst = dst;
-    g_last_dma_len = length;
-    g_last_dma_mram = mram;
-    g_last_dma_use_os_mram = use_os_mram;
-    g_has_last_dma = 1;
-    pthread_mutex_unlock(&g_dma_info_mtx);
-}
-
 /**
- * DPI Callback: Called from RTL when DMA transfer completes
+ * DPI Callback: Called from RTL when the DMA channel raises ch_done.
+ * This is the interrupt line of the device. The interrupt is handled
+ * once, in the notifier thread, by dma_irq_handler().
  */
 void dma_done_callback(void)
 {
-    uint64_t dst_off = 0;
-    uint64_t len = 0;
-    struct memphy_struct *mram = NULL;
-    int use_os_mram = 0;
-    int has_info = 0;
+}
+/**
+ * dma_irq_handler - interrupt handler for one finished DMA job
+ * Runs in the notifier thread. The job information is passed in, so the
+ * handler reports the job that finished, not the latest one submitted.
+ */
+void dma_irq_handler(uint32_t pid, uint64_t dst_off, uint64_t len,
+                     struct memphy_struct *mram, int use_os_mram)
+{
+    const uint8_t *pdst = NULL;
+    uint64_t max_len = 0;
 
-    pthread_mutex_lock(&g_dma_info_mtx);
-    dst_off = g_last_dma_dst;
-    len = g_last_dma_len;
-    mram = g_last_dma_mram;
-    use_os_mram = g_last_dma_use_os_mram;
-    has_info = g_has_last_dma;
-    pthread_mutex_unlock(&g_dma_info_mtx);
+    printf("DMA completed: pid=%u\n", pid);
 
-    printf("DMA completed\n");
-
-    if (has_info && len > 0) {
-        const uint8_t *pdst = NULL;
-        uint64_t max_len = 0;
-
-        if (memory_bank_is_available()) {
-            pdst = (const uint8_t *)memory_bank_get_ptr(dst_off);
-            max_len = len;
-        } else if (use_os_mram && mram != NULL && mram->storage != NULL && mram->maxsz > 0) {
-            uint64_t maxsz = (uint64_t)mram->maxsz;
-            if (dst_off < maxsz) {
-                pdst = (const uint8_t *)(mram->storage + dst_off);
-                max_len = (len < maxsz - dst_off) ? len : (maxsz - dst_off);
-            }
-        }
-
-        if (pdst != NULL && max_len > 0) {
-            uint64_t show = (max_len < 8) ? max_len : 8;
-            printf("  dst @ %llu (len=%llu): ",
-                   (unsigned long long)dst_off,
-                   (unsigned long long)len);
-            for (uint64_t i = 0; i < show; i++) {
-                printf("0x%02x%s", pdst[i], (i + 1 < show) ? " " : "");
-            }
-            printf("\n");
+    if (memory_bank_is_available()) 
+    {
+        pdst = (const uint8_t *)memory_bank_get_ptr(dst_off);
+        max_len = len;
+    } 
+    else if (use_os_mram && mram != NULL && mram->storage != NULL && mram->maxsz > 0) 
+    {
+        uint64_t maxsz = (uint64_t)mram->maxsz;
+        if (dst_off < maxsz) 
+        {
+            pdst = (const uint8_t *)(mram->storage + dst_off);
+            max_len = (len < maxsz - dst_off) ? len : (maxsz - dst_off);
         }
     }
 
+    if (pdst != NULL && max_len > 0) 
+    {
+        uint64_t show = (max_len < 8) ? max_len : 8;
+        printf("  dst @ %llu (len=%llu): ",
+               (unsigned long long)dst_off,
+               (unsigned long long)len);
+        for (uint64_t i = 0; i < show; i++) 
+        {
+            printf("0x%02x%s", pdst[i], (i + 1 < show) ? " " : "");
+        }
+        printf("\n");
+    }
     fflush(stdout);
 }
-
 
 /**
  * DPI Callback: Called from RTL when DMA transfer completes
