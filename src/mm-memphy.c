@@ -70,17 +70,26 @@ int MEMPHY_seq_read(struct memphy_struct *mp, addr_t addr, BYTE *value)
 int MEMPHY_read(struct memphy_struct *mp, addr_t addr, BYTE *value)
 {
    if (mp == NULL || value == NULL || mp->storage == NULL || mp->maxsz <= 0)
+   {
       return -1;
+   }
 
    if (addr >= (addr_t)mp->maxsz)
+   {
       return -1;
+   }
 
    /* rdmflg = 0 for seq and = 1 for RAM */
    if (mp->rdmflg)
+   {
       *value = mp->storage[addr];
-   else /* Sequential access device */
-      return MEMPHY_seq_read(mp, addr, value);
-
+   }
+   else if (MEMPHY_seq_read(mp, addr, value) != 0) /* Sequential access device */
+   {
+      return -1;
+   }
+ 
+   __atomic_fetch_add(&mp->nread, 1, __ATOMIC_RELAXED);
    return 0;
 }
 
@@ -115,15 +124,25 @@ int MEMPHY_seq_write(struct memphy_struct *mp, addr_t addr, BYTE value)
 int MEMPHY_write(struct memphy_struct *mp, addr_t addr, BYTE data)
 {
    if (mp == NULL || mp->storage == NULL || mp->maxsz <= 0)
+   {
       return -1;
+   }
 
    if (addr >= (addr_t)mp->maxsz)
+   {
       return -1;
+   }
 
    if (mp->rdmflg)
+   {
       mp->storage[addr] = data;
-   else /* Sequential access device */
-      return MEMPHY_seq_write(mp, addr, data);
+   }
+   else if (MEMPHY_seq_write(mp, addr, data) != 0) /* Sequential access device */
+   {
+      return -1;
+   }
+ 
+   __atomic_fetch_add(&mp->nwrite, 1, __ATOMIC_RELAXED);
 
    return 0;
 }
@@ -430,7 +449,6 @@ long MEMPHY_verify(struct memphy_struct* mp)
     return bad;
 }
 
-
 /*
  *  Init MEMPHY struct
  */
@@ -450,7 +468,8 @@ int init_memphy(struct memphy_struct *mp, addr_t max_size, int randomflg)
    mp->fp_bitmap = NULL;
    mp->numfp = 0;
    mp->nfree = 0;
-
+   mp->nread = 0;
+   mp->nwrite= 0;
    /* maxsz is currently an int field, so reject values it cannot represent. */
    if (max_size > (addr_t)INT_MAX)
       return -1;
