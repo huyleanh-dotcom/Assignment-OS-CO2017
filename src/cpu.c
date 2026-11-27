@@ -178,7 +178,17 @@ switch (ins.opcode)
 		 * vao thanh ghi dich regs[arg_2], khong ghi vao operand */
 		uint32_t rd_val = 0;
 		stat = libread(proc, ins.arg_0, ins.arg_1, &rd_val);
-		proc->regs[ins.arg_2] = rd_val;
+		if (stat == 0) 
+		{
+			if (ins.arg_2 < sizeof(proc->regs) / sizeof(proc->regs[0])) 
+			{
+				proc->regs[ins.arg_2] = rd_val;
+			} 
+			else 
+			{
+				stat = -1;	/* destination register does not exist */
+			}
+		}
 	}
 #else
 		stat = read(proc, ins.arg_0, ins.arg_1, ins.arg_2);
