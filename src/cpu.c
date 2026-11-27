@@ -197,5 +197,11 @@ switch (ins.opcode)
 	default:
 		stat = 1;
 	}
+#ifdef MM_PAGING
+	if (stat != 0) 
+	{
+		report_invalid_mem_op(proc, ins);
+	}
+#endif
 	return stat;
 }
