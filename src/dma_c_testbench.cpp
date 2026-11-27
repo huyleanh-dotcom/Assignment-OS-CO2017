@@ -51,6 +51,7 @@ extern "C" int dpi_rtl_dma_is_available(void);
 #define DMA_QUEUE_CAP 64
 
 typedef struct {
+    uint32_t pid;
     uint64_t src;
     uint64_t dst;
     uint64_t length;
@@ -182,14 +183,14 @@ static void *dma_notifier_thread(void *arg) {
         pthread_mutex_unlock(&g_dma_notifier.mtx);
 
         if (job.status == 0) {
-             printf("[DMA_NOTIFIER tid=%lu] IRQ: src=%llu dst=%llu len=%llu %s\n",
-               (unsigned long)pthread_self(),
+             printf("[DMA_NOTIFIER tid=%lu] IRQ: pid=%u src=%llu dst=%llu len=%llu done\n",
+               (unsigned long)pthread_self(), job.pid,
                (unsigned long long)job.src,
                (unsigned long long)job.dst,
                (unsigned long long)job.length,
-               job.status == 0 ? "done" : "FAILED");
         fflush(stdout);
-        dma_done_callback();
+        dma_irq_handler(job.pid, job.dst, job.length,
+                        job.mram, job.use_os_mram);
         }
     }
 
@@ -242,8 +243,6 @@ static void *dma_engine_thread(void *arg) {
         dma_job_t done_job = job;
         done_job.status = (rc >= 0) ? 0 : -1;
         if (done_job.status == 0) {
-            dma_record_last_transfer(job.src, job.dst, job.length,
-                                     job.mram, job.use_os_mram);
         if (dma_queue_enqueue(&g_dma_notifier, &done_job) != 0) {
             /* notifier queue full or stopped: report here.
              * Do NOT call dma_done_callback() by hand: it would print twice. */
@@ -410,6 +409,7 @@ int dpi_dma_copy(struct pcb_t *caller, uint64_t src_offset, uint64_t dst_offset,
            (unsigned long long)length);
 
     dma_job_t job = {
+        .pid = (caller != NULL) ? caller->pid : 0,
         .src = src_offset,
         .dst = dst_offset,
         .length = length,
