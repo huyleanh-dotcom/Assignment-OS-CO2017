@@ -1343,7 +1343,8 @@ static struct memphy_struct* pt_swap_dev(struct krnl_t* krnl, int swptyp);
 static int pt_region_span(struct mm_struct* mm, int rgid, addr_t offset,
     addr_t size, addr_t* va);
 static int pt_user_byte_phys(struct pcb_t* caller, addr_t va, int is_write, addr_t* phys);
-
+static int pt_kmem_region_va(struct pcb_t* caller, int vmaid, int rgid,
+    addr_t offset, addr_t* va);
 // help function to determine physical address from calling dma in continous memory region 
 static int dma_kregion_contig_phys(struct krnl_t* krnl, uint32_t pid, int reg, uint32_t offset, uint32_t length, addr_t* out_phys )
 {
@@ -1375,6 +1376,33 @@ static int dma_uregion_contig_phys(struct pcb_t* caller, int rgid, addr_t offset
     *out_phys = first_phys;
     return 0;
 }
+/* dma_print_address - show how one DMA operand is seen by the CPU and the DMA.
+ * The CPU uses the virtual address, translated by the MMU (page table).
+ * The DMA uses the bus address. The system bus maps RAM one to one,
+ * so the bus address is the physical address (offset in RAM). */
+static void dma_print_address(struct pcb_t *caller, const char *role, uint32_t rgid,
+                              int is_kernel, addr_t offset, addr_t phys)
+{
+    addr_t va = 0;
+    int rc;
+
+    if (is_kernel) 
+	{
+        rc = pt_kmem_region_va(caller, -1, (int)rgid, offset, &va);
+    }
+	else 
+	{
+        rc = pt_region_span(caller->mm, (int)rgid, offset, 1, &va);
+    }
+    if (rc != PT_STATUS_OK) 
+	{
+        return;
+    }
+    printf("\tPID %d: dma_memcpy %s = %s region %u: VA 0x%llx -> MMU -> PA 0x%llx = bus address 0x%llx\n",
+           caller->pid, role, is_kernel ? "kernel" : "user", rgid,
+           (unsigned long long)va, (unsigned long long)phys,
+           (unsigned long long)phys);
+}
 /*libmem_dma_memcpy - DMA memcpy
  *@caller: caller
  *@src: source region
@@ -1398,6 +1426,7 @@ int libmem_dma_memcpy(struct pcb_t *caller, uint32_t src, uint32_t dst, uint32_t
   //krnl->...
     addr_t src_phys = 0, dst_phys = 0;
     int got_src = 0, got_dst = 0;
+	int src_kernel = 0, dst_kernel = 0;
     if (size == 0)
         return 0;
     if (caller == NULL || caller->krnl == NULL || caller->krnl->mram == NULL)
@@ -1406,6 +1435,7 @@ int libmem_dma_memcpy(struct pcb_t *caller, uint32_t src, uint32_t dst, uint32_t
     if (dma_kregion_contig_phys(caller->krnl, caller->pid, (int)src,
                                 (addr_t)offset, (addr_t)size, &src_phys) == 0) {
         got_src = 1;
+		src_kernel = 1;
     } else if (caller->mm != NULL &&
                dma_uregion_contig_phys(caller, (int)src,
                                        (addr_t)offset, (addr_t)size, 0, &src_phys) == 0) {
@@ -1414,11 +1444,17 @@ int libmem_dma_memcpy(struct pcb_t *caller, uint32_t src, uint32_t dst, uint32_t
     if (dma_kregion_contig_phys(caller->krnl, caller->pid, (int)dst,
                                 (addr_t)offset, (addr_t)size, &dst_phys) == 0) {
         got_dst = 1;
+		dst_kernel = 1;
     } else if (caller->mm != NULL &&
                dma_uregion_contig_phys(caller, (int)dst,
                                        (addr_t)offset, (addr_t)size, 1, &dst_phys) == 0) {
         got_dst = 1;
     }
+	if (got_src && got_dst) 
+	{
+		dma_print_address(caller, "src", src, src_kernel, (addr_t)offset, src_phys);
+		dma_print_address(caller, "dst", dst, dst_kernel, (addr_t)offset, dst_phys);
+	}
     pthread_mutex_unlock(&mmvm_lock);
     if (!got_src || !got_dst)
         return -1;
