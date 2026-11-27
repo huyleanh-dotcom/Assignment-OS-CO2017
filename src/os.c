@@ -334,8 +334,11 @@ static void * co_processor(void *arg) {
 	/* TODO: This asynchronous implementation of DMA
      *        DMA completion callback is not yet implemented in this testbench
      */
-    // Install callback handler
-    //dma_done_callback();  // Call the callback to signal DMA completion
+	if (dma_engine_init() != 0 || dma_notifier_init() != 0) 
+	{
+		printf("Cannot start DMA engine/notifier threads\n");
+		return (void*)1;
+	}
     return NULL;
 }
 
@@ -557,6 +560,10 @@ int main(int argc, char * argv[]) {
 
 	/* Init scheduler */
 	init_scheduler();
+	
+	/* Start the co-processor first, so DMA is ready before any process runs */
+	pthread_create(dma, NULL, co_processor, NULL);
+	pthread_join(*dma, NULL);
 
 	/* Run CPU and loader */
 #ifdef MM_PAGING
@@ -568,9 +575,6 @@ int main(int argc, char * argv[]) {
 		pthread_create(&cpu[i], NULL,
 			cpu_routine, (void*)&args[i]);
 	}
-
-	/* Run co-processor */
-	pthread_create(dma, NULL, co_processor, NULL);
 
 	/* Wait for CPU and loader finishing */
 	for (i = 0; i < num_cpus; i++) {
