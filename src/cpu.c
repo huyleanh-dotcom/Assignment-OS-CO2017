@@ -13,6 +13,66 @@
 #include "mm.h"
 #include "syscall.h"
 #include "libmem.h"
+#ifdef MM_PAGING
+/* Return the name of a memory instruction and its number of arguments.
+ * Return NULL if the opcode is not a memory instruction. */
+static const char *mem_op_name(enum ins_opcode_t opcode, int *nargs)
+{
+	switch (opcode) 
+	{
+	case ALLOC:
+		*nargs = 2;
+		return "alloc";
+	case FREE:
+		*nargs = 1;
+		return "free";
+	case READ:
+		*nargs = 3;
+		return "read";
+	case WRITE:
+		*nargs = 3;
+		return "write";
+	case KMALLOC:
+		*nargs = 2;
+		return "kmalloc";
+	case COPY_FROM_USER:
+		*nargs = 4;
+		return "copy_from_user";
+	case COPY_TO_USER:
+		*nargs = 4;
+		return "copy_to_user";
+	case DMA_MEMCPY:
+		*nargs = 4;
+		return "dma_memcpy";
+	default:
+		return NULL;
+	}
+}
+
+/* Print one line when a memory instruction is rejected */
+static void report_invalid_mem_op(struct pcb_t *proc, struct inst_t ins)
+{
+	unsigned long long args[4] = {
+		(unsigned long long)ins.arg_0, (unsigned long long)ins.arg_1,
+		(unsigned long long)ins.arg_2, (unsigned long long)ins.arg_3
+	};
+	int nargs = 0;
+	int i;
+	const char *name = mem_op_name(ins.opcode, &nargs);
+
+	if (name == NULL) 
+	{
+		return;
+	}
+	printf("\tPID %d: invalid memory operation: %s", proc->pid, name);
+	for (i = 0; i < nargs; i++) 
+	{
+		printf(" %llu", args[i]);
+	}
+	printf("\n");
+}
+#endif
+
 
 int calc(struct pcb_t *proc)
 {
