@@ -122,6 +122,7 @@ static struct {
     unsigned long allocs;
     unsigned long frees;
     unsigned long walks;
+    unsigned long peak;                  /* max number of tables alive at once */
 } g_pt_stats;
 
 unsigned long pt_host_tables_live(void)
@@ -149,15 +150,23 @@ static mm64_table_t* pt_table_alloc(unsigned level)
 
 #ifdef MM64_TESTING
     if (g_pt_fail_after >= 0 && g_pt_fail_after-- == 0)
+	{
         return NULL;
+	}
 #endif
 
     if (posix_memalign((void**)&t, MM64_PAGE_SIZE, sizeof(mm64_table_t)) != 0)
+	{
         return NULL;
+	}
 
     memset(t, 0, sizeof(*t));
     g_pt_stats.live[level]++;
     g_pt_stats.allocs++;
+    if (pt_host_tables_live() > g_pt_stats.peak)
+	{
+        g_pt_stats.peak = pt_host_tables_live();	
+	}
     return t;
 }
 
@@ -1787,6 +1796,7 @@ int pt_page_table_stats(struct mm_struct* mm, struct pt_table_stats* out)
         out->total_tables += out->tables[l];
     out->host_bytes = out->total_tables * MM64_PAGE_SIZE;
     out->walks = g_pt_stats.walks;
+	out->peak_tables = g_pt_stats.peak;
     out->allocs = g_pt_stats.allocs;
     out->frees = g_pt_stats.frees;
     return bad == 0 ? 0 : -1;
@@ -1840,6 +1850,7 @@ int print_pgtbl(struct pcb_t* caller, addr_t start, addr_t end)
 
     /* lookup thuần (create = 0): UNMAPPED vẫn cho biết các bảng đã có */
     pt_walk_internal((mm64_table_t*)caller->mm->pgd, start, 0, &w);
+	g_pt_stats.walks--; 
     for (l = 0; l < MM64_PT_LEVELS; l++)
         tbl[l] = (addr_t)(uintptr_t)w.tbl[l];
     printf(" PDG=%016llx P4g=%016llx PUD=%016llx PMD=%016llx\n",
