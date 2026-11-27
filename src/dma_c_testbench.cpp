@@ -387,11 +387,16 @@ int dpi_dma_copy(struct pcb_t *caller, uint64_t src_offset, uint64_t dst_offset,
         printf("Failed to init DMA notifier thread\n");
         return -1;
     }
-
-    uint8_t *psrc = (uint8_t *)src;
-    uint64_t pattern_length = (length <= 255) ? length : 255;
-    for (uint64_t i = 0; i < length; i++) {
-        psrc[i] = (uint8_t)((i % pattern_length) + 1);
+    /* Fill a test pattern only in standalone testbench mode.
+     * In OS mode the source region holds real process data. */
+    if (!use_os_mram) 
+    {
+        uint8_t *psrc = (uint8_t *)src;
+        uint64_t pattern_length = (length <= 255) ? length : 255;
+        for (uint64_t i = 0; i < length; i++) 
+        {
+            psrc[i] = (uint8_t)((i % pattern_length) + 1);
+        }
     }
 
     printf("dpi_dma_copy: src=%llu, dst=%llu, len=%llu\n",
