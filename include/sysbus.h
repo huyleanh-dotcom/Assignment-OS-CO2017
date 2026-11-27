@@ -55,8 +55,9 @@ void dma_done_callback(void);
 struct memphy_struct;
 void sysbus_set_os_mram(struct memphy_struct *mram);
 
-void dma_record_last_transfer(uint64_t src, uint64_t dst, uint64_t length,
-                              struct memphy_struct *mram, int use_os_mram);
+// Interrupt handler for one finished DMA job (runs in the notifier thread)
+void dma_irq_handler(uint32_t pid, uint64_t dst_off, uint64_t len,
+                     struct memphy_struct *mram, int use_os_mram);
 
 #ifdef __cplusplus
 }
