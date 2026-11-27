@@ -584,10 +584,16 @@ int main(int argc, char * argv[]) {
 
 	/* Stop timer */
 	stop_timer();
+
+	/* Finish pending DMA jobs and interrupts, then free the RTL model */
+	dma_worker_shutdown();
+	dma_notifier_shutdown();
+	rtl_dma_cleanup_simulation();
+	free(dma);
+
 #ifdef MM_PAGING
 	print_memory_stats(&mram, mswp);
 #endif
-    rtl_dma_cleanup_simulation();
 	return 0;
 
 }
