@@ -342,7 +342,10 @@ int liballoc(struct pcb_t *proc, addr_t size, uint32_t reg_index)
   }
 
   /* luu dia chi da cap vao thanh ghi */
-  proc->regs[reg_index] = addr;
+  if (reg_index < sizeof(proc->regs) / sizeof(proc->regs[0]))
+  {
+	  proc->regs[reg_index] = addr;
+  }
 
 #ifdef IODUMP
   /* TODO dump IO content (if needed) */
@@ -1208,7 +1211,10 @@ int libkmem_malloc(struct pcb_t * caller, uint32_t size, uint32_t reg_index)
   addr_t addr;
   if (__kmalloc(caller, 0, reg_index, size, &addr) != 0)
     return -1;
-  caller->regs[reg_index] = addr;
+  if (reg_index < sizeof(caller->regs) / sizeof(caller->regs[0]))
+  {
+	  caller->regs[reg_index] = addr;
+  }
 
   /*
    * TODO: provide OS kmem allocation validation
