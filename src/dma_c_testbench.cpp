@@ -187,7 +187,7 @@ static void *dma_notifier_thread(void *arg) {
                (unsigned long)pthread_self(), job.pid,
                (unsigned long long)job.src,
                (unsigned long long)job.dst,
-               (unsigned long long)job.length,
+               (unsigned long long)job.length);
         fflush(stdout);
         dma_irq_handler(job.pid, job.dst, job.length,
                         job.mram, job.use_os_mram);
