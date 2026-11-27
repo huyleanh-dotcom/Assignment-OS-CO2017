@@ -201,6 +201,10 @@ struct memphy_struct {
    addr_t numfp;                
    addr_t nfree;                
    unsigned char* fp_bitmap;    
+
+   /* Access statistics: number of successful byte reads and writes */
+   unsigned long nread;
+   unsigned long nwrite;
 };
 
 #endif
