@@ -25,6 +25,11 @@ void rtl_dma_cleanup_simulation(void);
 int dpi_rtl_dma_copy(uint64_t src_offset, uint64_t dst_offset, uint64_t length);
 int dpi_rtl_dma_is_available(void);
 void dma_done_callback(void);
+// DMA engine (copy) and notifier (interrupt handler) threads
+int dma_engine_init(void);
+int dma_notifier_init(void);
+void dma_worker_shutdown(void);
+void dma_notifier_shutdown(void);
 
 #ifdef __cplusplus
 }
