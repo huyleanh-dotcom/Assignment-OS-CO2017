@@ -239,6 +239,7 @@ struct pt_table_stats {
     unsigned long present, swapped, invalid;      /* leaf (khi mm != NULL) */
     unsigned long user_leaves, kernel_leaves;
     unsigned long walks, allocs, frees;           /* bộ đếm toàn cục      */
+    unsigned long peak_tables; 						/* max tables alive at once */
 };
 int pt_page_table_stats(struct mm_struct* mm, struct pt_table_stats* out);
 int get_pd_from_address(addr_t addr, addr_t* pgd, addr_t* p4d, addr_t* pud, addr_t* pmd, addr_t* pt);
