@@ -400,6 +400,31 @@ static void * ld_routine(void * args) {
 	detach_event(timer_id);
 	pthread_exit(NULL);
 }
+#ifdef MM_PAGING
+/* Print memory access counts and page-table storage at the end of a run */
+static void print_memory_stats(struct memphy_struct *ram,
+                               struct memphy_struct swaps[PAGING_MAX_MMSWP])
+{
+	struct pt_table_stats st;
+	int id;
+
+	pt_page_table_stats(NULL, &st);
+	printf("===== Memory statistics =====\n");
+	printf("RAM   : %d B, %lu byte reads, %lu byte writes\n",
+	       ram->maxsz, ram->nread, ram->nwrite);
+	for (id = 0; id < PAGING_MAX_MMSWP; id++) 
+	{
+		if (swaps[id].maxsz > 0) 
+		{
+			printf("SWAP%d : %d B, %lu byte reads, %lu byte writes\n",
+			       id, swaps[id].maxsz, swaps[id].nread, swaps[id].nwrite);
+		}
+	}
+	printf("Page-table walks: %lu (up to 5 table levels per walk)\n", st.walks);
+	printf("Page-table storage: peak %lu tables = %lu B, at exit %lu tables\n",
+	       st.peak_tables, st.peak_tables * 4096UL, st.total_tables);
+}
+#endif
 
 static void read_config(const char * path) {
 	FILE * file;
@@ -555,6 +580,9 @@ int main(int argc, char * argv[]) {
 
 	/* Stop timer */
 	stop_timer();
+#ifdef MM_PAGING
+	print_memory_stats(&mram, mswp);
+#endif
     rtl_dma_cleanup_simulation();
 	return 0;
 
