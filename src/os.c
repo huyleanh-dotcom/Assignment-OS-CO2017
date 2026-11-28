@@ -266,6 +266,7 @@ static void * cpu_routine(void * args) {
 	/* Check for new process in ready queue */
 	int time_left = 0;
 	struct pcb_t * proc = NULL;
+	int dma_issued;
 	while (1) {
 		/* Check the status of current process */
 		if (proc == NULL) {
@@ -311,8 +312,17 @@ static void * cpu_routine(void * args) {
 			time_left = time_slot;
 		}
 		
-		/* Run current process */
-		run(proc);
+		dma_issued = (proc->pc < proc->code->size &&
+			      proc->code->text[proc->pc].opcode == DMA_MEMCPY);
+		if (dma_issued) 
+		{
+			dma_wait_begin(proc);
+		}
+		if (run(proc) != 0 && dma_issued) 
+		{
+			dma_wait_abort(proc);
+		}
+
 		time_left--;
 		next_slot(timer_id);
 	}
