@@ -329,6 +329,13 @@ static void * cpu_routine(void * args) {
 		}
 
 		time_left--;
+		if (block_proc_on_dma(proc)) 
+		{
+			/* The process waits for its DMA interrupt: run another one */
+			printf("\tCPU %d: Process %2d waits for DMA\n", id, proc->pid);
+			proc = NULL;
+			time_left = 0;
+		}
 		next_slot(timer_id);
 	}
 	detach_event(timer_id);
