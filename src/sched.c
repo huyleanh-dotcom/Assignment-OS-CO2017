@@ -291,3 +291,18 @@ void dma_wait_abort(struct pcb_t *proc)
 	dma_pending_dec(proc);
 	pthread_mutex_unlock(&queue_lock);
 }
+
+int block_proc_on_dma(struct pcb_t *proc)
+{
+	int blocked = 0;
+
+	pthread_mutex_lock(&queue_lock);
+	if (dma_pending_of(proc) != NULL) 
+	{
+		purgequeue(&running_list, proc);
+		enqueue(&dma_waiting_list, proc);
+		blocked = 1;
+	}
+	pthread_mutex_unlock(&queue_lock);
+	return blocked;
+}
