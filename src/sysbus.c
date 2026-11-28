@@ -214,6 +214,13 @@ void dma_done_callback(void)
  * Runs in the notifier thread. The job information is passed in, so the
  * handler reports the job that finished, not the latest one submitted.
  */
+static dma_irq_hook_t g_dma_irq_hook = NULL;
+
+/* Install the function that wakes up the process waiting for a DMA job */
+void dma_set_irq_hook(dma_irq_hook_t hook)
+{
+    g_dma_irq_hook = hook;
+}
 void dma_irq_handler(uint32_t pid, uint64_t dst_off, uint64_t len,
                      struct memphy_struct *mram, int use_os_mram)
 {
