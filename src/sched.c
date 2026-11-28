@@ -21,6 +21,14 @@ static pthread_mutex_t queue_lock;
 static struct queue_t running_list;
 /* Processes blocked until their DMA completion interrupt arrives */
 static struct queue_t dma_waiting_list;
+/* DMA jobs not finished yet, one entry per process that has some
+* (static storage starts as all zero). */
+static struct 
+{
+	struct pcb_t *proc;
+	int pending;
+} dma_pending_tbl[MAX_QUEUE_SIZE];
+
 #ifdef MLQ_SCHED
 static struct queue_t mlq_ready_queue[MAX_PRIO];
 static int slot[MAX_PRIO];
@@ -212,3 +220,74 @@ void finish_proc(struct pcb_t *proc)
 	pthread_mutex_unlock(&queue_lock);
 }
 
+/* Entry of @proc in dma_pending_tbl, or NULL. Caller holds queue_lock. */
+static int *dma_pending_of(struct pcb_t *proc)
+{
+	int i;
+
+	for (i = 0; i < MAX_QUEUE_SIZE; i++) 
+	{
+		if (dma_pending_tbl[i].proc == proc) 
+		{
+			return &dma_pending_tbl[i].pending;
+		}
+	}
+	return NULL;
+}
+
+/* Decrease the count of @proc; free its entry when it reaches 0.
+ * Return the new count. Caller holds queue_lock. */
+static int dma_pending_dec(struct pcb_t *proc)
+{
+	int i;
+
+	for (i = 0; i < MAX_QUEUE_SIZE; i++) 
+	{
+		if (dma_pending_tbl[i].proc == proc) 
+		{
+			dma_pending_tbl[i].pending--;
+			if (dma_pending_tbl[i].pending <= 0) 
+			{
+				dma_pending_tbl[i].proc = NULL;
+				dma_pending_tbl[i].pending = 0;
+				return 0;
+			}
+			return dma_pending_tbl[i].pending;
+		}
+	}
+	return 0;
+}
+
+/* Called before a DMA job is submitted: one more job to wait for */
+void dma_wait_begin(struct pcb_t *proc)
+{
+	int *pending;
+	int i;
+
+	pthread_mutex_lock(&queue_lock);
+	pending = dma_pending_of(proc);
+	if (pending != NULL) {
+		(*pending)++;
+	} 
+	else 
+	{
+		for (i = 0; i < MAX_QUEUE_SIZE; i++) 
+		{
+			if (dma_pending_tbl[i].proc == NULL) 
+			{
+				dma_pending_tbl[i].proc = proc;
+				dma_pending_tbl[i].pending = 1;
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&queue_lock);
+}
+
+/* Called when the DMA job could not be submitted */
+void dma_wait_abort(struct pcb_t *proc)
+{
+	pthread_mutex_lock(&queue_lock);
+	dma_pending_dec(proc);
+	pthread_mutex_unlock(&queue_lock);
+}
