@@ -679,7 +679,8 @@ int libread(
         return -1;
     *destination = data;
 #ifdef IODUMP
-    /* TODO dump IO content (if needed) */
+    printf("\tPID %d: read region %u offset %llu -> 0x%02x\n",
+           proc->pid, source, (unsigned long long)offset, data);
 #ifdef PAGETBL_DUMP
     pgtbl_dump_locked(proc); 
 #endif
