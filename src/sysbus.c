@@ -249,7 +249,7 @@ void dma_irq_handler(uint32_t pid, uint64_t dst_off, uint64_t len,
         }
         printf("\n");
     }
-    fflush(stdout)    
+    fflush(stdout);    
     /* Wake up the process that issued this job */
     if (g_dma_irq_hook != NULL)
     {
