@@ -54,7 +54,9 @@ void dma_done_callback(void);
 
 struct memphy_struct;
 void sysbus_set_os_mram(struct memphy_struct *mram);
-
+// Function called by the interrupt handler to wake up the waiting process
+typedef void (*dma_irq_hook_t)(uint32_t pid);
+void dma_set_irq_hook(dma_irq_hook_t hook);
 // Interrupt handler for one finished DMA job (runs in the notifier thread)
 void dma_irq_handler(uint32_t pid, uint64_t dst_off, uint64_t len,
                      struct memphy_struct *mram, int use_os_mram);
