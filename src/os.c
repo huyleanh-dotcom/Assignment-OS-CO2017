@@ -344,6 +344,7 @@ static void * co_processor(void *arg) {
 	/* TODO: This asynchronous implementation of DMA
      *        DMA completion callback is not yet implemented in this testbench
      */
+	dma_set_irq_hook(wake_up_dma_proc);
 	if (dma_engine_init() != 0 || dma_notifier_init() != 0) 
 	{
 		printf("Cannot start DMA engine/notifier threads\n");
