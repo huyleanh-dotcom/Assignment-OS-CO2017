@@ -344,3 +344,24 @@ void wake_up_dma_proc(uint32_t pid)
 	}
 	pthread_mutex_unlock(&queue_lock);
 }
+/* Return 1 if a process is waiting for a DMA interrupt or is ready to run. */
+int has_pending_work(void)
+{
+	int pending;
+#ifdef MLQ_SCHED
+	int i;
+#endif
+
+	pthread_mutex_lock(&queue_lock);
+	pending = !empty(&dma_waiting_list);
+#ifdef MLQ_SCHED
+	for (i = 0; i < MAX_PRIO && !pending; i++) 
+	{
+		pending = !empty(&mlq_ready_queue[i]);
+	}
+#else
+	pending = pending || !empty(&ready_queue) || !empty(&run_queue);
+#endif
+	pthread_mutex_unlock(&queue_lock);
+	return pending;
+}
