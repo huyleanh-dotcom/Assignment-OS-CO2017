@@ -19,6 +19,8 @@ static struct queue_t run_queue;
 static pthread_mutex_t queue_lock;
 
 static struct queue_t running_list;
+/* Processes blocked until their DMA completion interrupt arrives */
+static struct queue_t dma_waiting_list;
 #ifdef MLQ_SCHED
 static struct queue_t mlq_ready_queue[MAX_PRIO];
 static int slot[MAX_PRIO];
@@ -46,6 +48,7 @@ void init_scheduler(void) {
 	ready_queue.size = 0;
 	run_queue.size = 0;
 	running_list.size = 0;
+	dma_waiting_list.size = 0;
 	pthread_mutex_init(&queue_lock, NULL);
 }
 
