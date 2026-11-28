@@ -32,6 +32,7 @@ void finish_proc(struct pcb_t * proc);
 /* DMA wait: a process that issued a DMA waits until its interrupt arrives */
 void dma_wait_begin(struct pcb_t * proc);
 void dma_wait_abort(struct pcb_t * proc);
+int block_proc_on_dma(struct pcb_t * proc);
 #ifdef __cplusplus
 }
 #endif
