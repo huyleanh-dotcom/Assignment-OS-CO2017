@@ -33,6 +33,7 @@ void finish_proc(struct pcb_t * proc);
 void dma_wait_begin(struct pcb_t * proc);
 void dma_wait_abort(struct pcb_t * proc);
 int block_proc_on_dma(struct pcb_t * proc);
+void wake_up_dma_proc(uint32_t pid);
 #ifdef __cplusplus
 }
 #endif
