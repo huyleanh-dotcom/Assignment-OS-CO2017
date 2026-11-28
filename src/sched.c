@@ -306,3 +306,41 @@ int block_proc_on_dma(struct pcb_t *proc)
 	pthread_mutex_unlock(&queue_lock);
 	return blocked;
 }
+
+/* Entry of the process with @pid in dma_pending_tbl, or -1. Caller holds queue_lock. */
+static int dma_pending_index_by_pid(uint32_t pid)
+{
+	int i;
+
+	for (i = 0; i < MAX_QUEUE_SIZE; i++) {
+		if (dma_pending_tbl[i].proc != NULL && dma_pending_tbl[i].proc->pid == pid) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+/* Called by the DMA interrupt handler when a job of process @pid is done.*/
+void wake_up_dma_proc(uint32_t pid)
+{
+	struct pcb_t *proc;
+	int idx;
+
+	pthread_mutex_lock(&queue_lock);
+	idx = dma_pending_index_by_pid(pid);
+	if (idx >= 0) 
+	{
+		proc = dma_pending_tbl[idx].proc;
+		if (dma_pending_dec(proc) == 0 &&
+		    purgequeue(&dma_waiting_list, proc) != NULL) 
+		{
+#ifdef MLQ_SCHED
+			enqueue(&mlq_ready_queue[proc->prio], proc);
+#else
+			enqueue(&ready_queue, proc);
+#endif
+			printf("\tWake up process %2d after DMA interrupt\n", proc->pid);
+		}
+	}
+	pthread_mutex_unlock(&queue_lock);
+}
