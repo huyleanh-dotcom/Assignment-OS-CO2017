@@ -297,16 +297,21 @@ static void * cpu_routine(void * args) {
 		}
 		
 		/* Recheck process status after loading new process */
-		if (proc == NULL && done) {
+		if (proc == NULL && done && !has_pending_work()) 
+		{
 			/* No process to run, exit */
 			printf("\tCPU %d stopped\n", id);
 			break;
-		}else if (proc == NULL) {
+		}
+		else if (proc == NULL) 
+		{
 			/* There may be new processes to run in
 			 * next time slots, just skip current slot */
 			next_slot(timer_id);
 			continue;
-		}else if (time_left == 0) {
+		}
+		else if (time_left == 0) 
+		{
 			printf("\tCPU %d: Dispatched process %2d\n",
 				id, proc->pid);
 			time_left = time_slot;
